@@ -1,11 +1,12 @@
 from __future__ import annotations
-
+from langchain_core.messages import SystemMessage, HumanMessage, BaseMessage, AIMessage
+from typing import Any, Dict, Optional, Callable, Tuple
 from abc import ABC, abstractmethod
 import os
-from typing import Any, Dict, Optional, Callable, Tuple
+
 from one_eval.serving.custom_llm_caller import CustomLLMCaller
-from langchain_core.messages import SystemMessage, HumanMessage, BaseMessage, AIMessage
-from dataflow_agent.logger import get_logger
+from one_eval.utils.prompts import prompt_registry
+from one_eval.logger import get_logger
 
 log = get_logger(__name__)
 
@@ -155,13 +156,18 @@ class CustomAgent(BaseAgent):
             api_key=self.api_key,
             agent_role=self.role_name,
         )
-        
+
+    def get_prompt(self, name: str, **kwargs) -> str:
+        """统一获取 prompt"""
+        tmpl = prompt_registry.get(name)
+        return tmpl.build_prompt(**kwargs)
+
     # ======= 核心执行逻辑 =======
     async def run(self, state):
         pre = {}
         msgs = [
-            SystemMessage(content=self.system_prompt),
-            HumanMessage(content=self.task_prompt.format(**state.__dict__))
+            SystemMessage(content=self.get_prompt(self.system_prompt_template_name)),
+            HumanMessage(content=self.get_prompt(self.task_prompt_template_name, **state.__dict__))
         ]
         llm = self.create_llm(state)
 

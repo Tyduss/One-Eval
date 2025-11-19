@@ -5,9 +5,8 @@ from one_eval.logger import get_logger
 log = get_logger(__name__)
 
 class BaseNode(ABC):
-    def __init__(self, name: str, llm_serving=None, tools=None):
+    def __init__(self, name: str, tools=None):
         self.name = name
-        self.llm_serving = llm_serving
         self.tools = tools or {}
 
     @abstractmethod
