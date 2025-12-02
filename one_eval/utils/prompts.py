@@ -81,13 +81,13 @@ prompt_registry.register(
 )
 
 # ======================================================
-# Step 2: BenchSearchAgent prompts
+# Step 2: BenchSearch (名称推荐) Prompts
 # ======================================================
 
 prompt_registry.register(
     "bench_search.system",
     """
-你是 One-Eval 系统中的 BenchSearchAgent。
+你是 One-Eval 系统中的 BenchSearchAgent（具体由 BenchNameSuggestAgent 实现）。
 你的工作是根据用户的任务需求，推荐合适的 benchmark 名称列表。
 
 你需要遵守以下要求：
@@ -103,15 +103,15 @@ prompt_registry.register(
     """
 下面是与当前评测任务相关的信息。请你根据这些信息，给出“推荐的 benchmark 名称列表”。
 
-你需要返回一个 JSON，格式 **必须严格为**：
+你需要返回一个 JSON，格式必须严格为：
 
 {{
   "bench_names": [
     "gsm8k",
+    "openai/gsm8k",
     "HuggingFaceH4/MATH-500",
     "mmlu",
-    "truthful_qa",
-    ...
+    "truthful_qa"
   ]
 }}
 

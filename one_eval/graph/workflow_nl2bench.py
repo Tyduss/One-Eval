@@ -1,12 +1,11 @@
 import asyncio
-import os
 from pathlib import Path
+
 from langgraph.graph import START, END
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from one_eval.core.state import NodeState
 from one_eval.core.graph import GraphBuilder
-from one_eval.toolkits.tool_manager import get_tool_manager
 
 from one_eval.nodes.query_understand_node import QueryUnderstandNode
 from one_eval.nodes.bench_search_node import BenchSearchNode
@@ -18,11 +17,9 @@ log = get_logger("OneEvalWorkflow")
 
 def build_workflow(checkpointer=None, **kwargs):
     """
-    OneEval Workflow: 
+    OneEval Workflow:
     START → QueryUnderstandNode → BenchSearchNode → END
     """
-    tm = get_tool_manager()
-
     builder = GraphBuilder(
         state_model=NodeState,
         entry_point="QueryUnderstandNode",
@@ -31,14 +28,14 @@ def build_workflow(checkpointer=None, **kwargs):
     # === Node 1: QueryUnderstand ===
     node1 = QueryUnderstandNode()
     builder.add_node(
-        name=node1.name,
+        name=node1.name,   # "QueryUnderstandNode"
         func=node1.run,
     )
 
     # === Node 2: BenchSearch ===
     node2 = BenchSearchNode()
     builder.add_node(
-        name=node2.name,
+        name=node2.name,   # "BenchSearchNode"
         func=node2.run,
     )
 
@@ -54,7 +51,7 @@ def build_workflow(checkpointer=None, **kwargs):
 
 async def run_demo(user_query: str):
     log.info(f"[workflow] 输入: {user_query}")
-    
+
     # === Checkpointer root ===
     current_file_path = Path(__file__).resolve()
     project_root = current_file_path.parents[2]
@@ -64,7 +61,6 @@ async def run_demo(user_query: str):
     db_dir.mkdir(parents=True, exist_ok=True)
 
     async with AsyncSqliteSaver.from_conn_string(db_path) as checkpointer:
-
         graph = build_workflow(checkpointer=checkpointer)
 
         initial_state = NodeState(user_query=user_query)
@@ -76,7 +72,6 @@ async def run_demo(user_query: str):
         final_state = await graph.ainvoke(initial_state, config=config)
 
         log.info(f"[workflow] 最终状态: {final_state}")
-
         return final_state
 
 
