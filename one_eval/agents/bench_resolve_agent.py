@@ -36,7 +36,6 @@ class BenchResolveAgent(CustomAgent):
             "specific_benches": q.get("specific_benches") or [],
         }
 
-    # -------- HF 解析逻辑（保持你原先的思路，稍微收拾一下） --------
     def _resolve_hf_bench(self, bench_name: str) -> Optional[Dict[str, Any]]:
         """
         尝试根据 bench_name 从 HuggingFace 拉取数据集信息：
@@ -69,7 +68,7 @@ class BenchResolveAgent(CustomAgent):
         try:
             candidates = list(list_datasets(search=bench_name, limit=10))
         except Exception as e:
-            log.warning(f"[BenchResolveAgent] list_datasets(search={bench_name}) 失败: {e}")
+            log.warning(f"list_datasets(search={bench_name}) 失败: {e}")
             return None
 
         bench_lower = bench_name.lower()
@@ -98,7 +97,7 @@ class BenchResolveAgent(CustomAgent):
                 "exists_on_hf": True,
             }
         except Exception as e:
-            log.warning(f"[BenchResolveAgent] DatasetCard.load({chosen_id}) 失败: {e}")
+            log.warning(f"DatasetCard.load({chosen_id}) 失败: {e}")
             return {
                 "bench_name": bench_name,
                 "hf_repo": chosen_id,
@@ -108,11 +107,11 @@ class BenchResolveAgent(CustomAgent):
             }
 
     async def run(self, state: NodeState) -> NodeState:
-        log.info("[BenchResolveAgent] 执行开始")
+        # log.info("[BenchResolveAgent] 执行开始")
 
         # 如果前一个 Agent 判定可以直接跳过，则不做任何事
         if state.temp_data.get("skip_resolve"):
-            log.info("[BenchResolveAgent] skip_resolve=True，直接返回")
+            log.info("skip_resolve=True，直接返回")
             return state
 
         info = self._extract_query_info(state)
@@ -146,7 +145,7 @@ class BenchResolveAgent(CustomAgent):
             if name not in names_to_resolve:
                 names_to_resolve.append(name)
 
-        log.info(f"[BenchResolveAgent] 需要在 HF 上解析的名称: {names_to_resolve}")
+        log.info(f"需要在 HF 上解析的名称: {names_to_resolve}")
 
         # ================ Step 2: HF 精确解析 ================
         hf_resolved: List[Dict[str, Any]] = []
@@ -177,5 +176,5 @@ class BenchResolveAgent(CustomAgent):
             "hf_resolved": hf_resolved,
         }
 
-        log.info(f"[BenchResolveAgent] 最终 bench 列表: {state.benches}")
+        log.info(f"最终 bench 列表: {state.benches}")
         return state

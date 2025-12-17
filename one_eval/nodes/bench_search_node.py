@@ -20,7 +20,7 @@ class BenchSearchNode(BaseNode):
         self.name = "BenchSearchNode"
 
     async def run(self, state: NodeState) -> NodeState:
-        log.info(f"[{self.name}] 节点开始执行")
+        # log.info(f"节点开始执行")
 
         # 1) 先通过 LLM 推荐 bench 名称 + 本地匹配（可能直接满足）
         suggest_agent = BenchNameSuggestAgent(
@@ -36,5 +36,5 @@ class BenchSearchNode(BaseNode):
         )
         state = await resolve_agent.run(state)
 
-        log.info(f"[{self.name}] 执行结束，最终 bench 数量: {len(getattr(state, 'benches', []))}")
+        log.info(f"执行结束，最终 bench 数量: {len(getattr(state, 'benches', []))}")
         return state

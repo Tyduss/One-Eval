@@ -44,12 +44,15 @@ class BenchNameSuggestAgent(CustomAgent):
         }
 
     async def run(self, state: NodeState) -> NodeState:
-        log.info("[BenchNameSuggestAgent] 执行开始")
+        # log.info("[BenchNameSuggestAgent] 执行开始")
 
         info = self._extract_query_info(state)
         domain: List[str] = info["domain"]
         specific_benches: List[str] = info["specific_benches"]
         user_query: str = info["user_query"]
+
+        human_feedback: str = info.get("human_feedback", "")
+        prev_benches: List[str] = info.get("benches", [])
 
         # ================ Step 1: 本地 BenchRegistry 搜索 ================
         registry = BenchRegistry("one_eval/utils/bench_table/bench_config.json")
@@ -61,7 +64,7 @@ class BenchNameSuggestAgent(CustomAgent):
         # log.warning(
         #     f"[BenchNameSuggestAgent] 检索关键词: specific_benches={specific_benches}, domain={domain}"
         # )
-        log.info(f"[BenchNameSuggestAgent] 本地匹配到 {len(local_matches)} 个 bench")
+        log.info(f"本地匹配到 {len(local_matches)} 个 bench")
 
         bench_info: Dict[str, Dict[str, Any]] = {
             m["bench_name"]: m for m in local_matches
@@ -78,7 +81,7 @@ class BenchNameSuggestAgent(CustomAgent):
             }
             # 标记后续 BenchResolveAgent 可以直接跳过
             state.temp_data["skip_resolve"] = True
-            log.info("[BenchNameSuggestAgent] 本地 bench >= 3，跳过推荐")
+            log.info("本地 bench >= 3，跳过推荐")
             return state
 
         # ================ Step 2: 通过 LLM 推荐 benchmark 名称列表 ================
@@ -86,6 +89,8 @@ class BenchNameSuggestAgent(CustomAgent):
         task_prompt = self.get_prompt(
             self.task_prompt_template_name,
             user_query=user_query,
+            human_feedback=human_feedback,
+            prev_benches=",".join(prev_benches),
             domain=",".join(domain),
             local_benches=",".join(bench_info.keys()),
         )
@@ -114,7 +119,7 @@ class BenchNameSuggestAgent(CustomAgent):
         # 去重保持顺序
         bench_names = list(dict.fromkeys(bench_names))
 
-        log.info(f"[BenchNameSuggestAgent] LLM 推荐 bench_names: {bench_names}")
+        log.info(f"LLM 推荐 bench_names: {bench_names}")
 
         # 把本地匹配 + 推荐名称写入中间状态，方便后续 BenchResolveAgent 使用
         state.bench_info = bench_info

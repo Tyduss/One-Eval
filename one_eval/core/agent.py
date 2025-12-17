@@ -96,7 +96,7 @@ class BaseAgent(ABC):
             if '```json' in content:
                 content = content.split('```json')[1].split('```')[0].strip()
             parsed = json.loads(content)
-            log.info(f"{self.role_name} 结果解析成功")
+            # log.info(f"{self.role_name} 结果解析成功")
             return parsed
         except ValueError as e:
             log.warning(f"JSON解析失败: {e}")

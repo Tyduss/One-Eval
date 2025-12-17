@@ -18,7 +18,7 @@ class QueryUnderstandNode(BaseNode):
         self.name = "QueryUnderstandNode"
 
     async def run(self, state: NodeState) -> NodeState:
-        log.info(f"[{self.name}] 节点开始执行")
+        # log.info(f"[{self.name}] 节点开始执行")
 
         # 获取全局 ToolManager
         tm = get_tool_manager()
@@ -31,6 +31,6 @@ class QueryUnderstandNode(BaseNode):
 
         new_state = await agent.run(state)
 
-        log.info(f"[{self.name}] 执行结束，输出结果: {new_state.result[agent.role_name]}")
+        log.info(f"执行结束，输出结果: {new_state.result[agent.role_name]}")
         
         return new_state
