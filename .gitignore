@@ -209,3 +209,4 @@ __marimo__/
 # diy
 env.sh
 checkpoints/
+outputs/
