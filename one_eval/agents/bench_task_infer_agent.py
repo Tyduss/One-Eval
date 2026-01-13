@@ -11,6 +11,15 @@ from one_eval.logger import get_logger
 
 log = get_logger("BenchTaskInferAgent")
 
+REQUIRED_KEYS = {
+    "key1_text_score": ["input_text_key"],
+    "key2_qa": ["input_question_key", "input_target_key"],
+    "key2_q_ma": ["input_question_key", "input_targets_key"],
+    "key3_q_choices_a": ["input_question_key", "input_choices_key", "input_label_key"],
+    "key3_q_choices_as": ["input_question_key", "input_choices_key", "input_labels_key"],
+    "key3_q_a_rejected": ["input_question_key", "input_better_key", "input_rejected_key"],
+}
+
 
 class BenchTaskInferAgent(CustomAgent):
     @property
@@ -68,13 +77,24 @@ class BenchTaskInferAgent(CustomAgent):
                 
                 eval_type = result.get("eval_type")
                 key_mapping = result.get("key_mapping")
+                reason = result.get("reason", "No reason provided by LLM")
 
                 if eval_type and key_mapping:
+                    # 校验必需字段
+                    if eval_type in REQUIRED_KEYS:
+                        missing = [k for k in REQUIRED_KEYS[eval_type] if k not in key_mapping or not key_mapping[k]]
+                        if missing:
+                            log.warning(f"[{bench.bench_name}] Missing required keys for {eval_type}: {missing}")
+                            # 可以在这里标记为 incomplete，或者让后续节点处理
+                            # 目前我们还是保存结果，但记录 warning 到 reason
+                            reason += f" [WARNING: Missing keys: {missing}]"
+
                     bench.bench_dataflow_eval_type = eval_type
                     if not bench.meta:
                         bench.meta = {}
                     bench.meta["key_mapping"] = key_mapping
-                    log.info(f"[{bench.bench_name}] 判定结果: {eval_type}, Mapping: {key_mapping}")
+                    bench.meta["key_mapping_reason"] = reason
+                    log.info(f"[{bench.bench_name}] 判定结果: {eval_type}, Mapping: {key_mapping}, Reason: {reason}")
                 else:
                     log.warning(f"[{bench.bench_name}] LLM 返回格式不完整: {content}")
 

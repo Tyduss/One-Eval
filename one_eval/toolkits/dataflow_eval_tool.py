@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import os
 import time
+import traceback
 from pathlib import Path
 from typing import Dict, Any, Optional
 
+import pandas as pd
 from dataflow.operators.core_text import BenchAnswerGenerator, UnifiedBenchDatasetEvaluator
 from dataflow.prompts.core_text import FormatStrPrompt
 from dataflow.utils.storage import FileStorage
@@ -59,6 +61,38 @@ class DataFlowEvalTool:
         
         self._current_model_config = config
 
+    def _preprocess_dataframe(self, df, bench_name, key_mapping, cache_path="", eval_type=""):
+        """Ad-hoc 数据预处理"""
+        
+        # 1. 自动合并 choices
+        choices_key = key_mapping.get("input_choices_key")
+        if isinstance(choices_key, list):
+            # 检查这些列是否都在 df 中
+            missing_cols = [c for c in choices_key if c not in df.columns]
+            if not missing_cols:
+                # 合并列
+                df["merged_choices"] = df.apply(lambda row: [str(row[c]) for c in choices_key], axis=1)
+                key_mapping["input_choices_key"] = "merged_choices"
+                log.info(f"[{bench_name}] Auto-merged columns {choices_key} into 'merged_choices'")
+            else:
+                log.warning(f"[{bench_name}] Cannot merge choices, missing columns: {missing_cols}")
+
+        # 2. 自动注入 choices (针对 key3_q_choices_a)
+        if eval_type == "key3_q_choices_a":
+            # 如果 input_choices_key 缺失，或者对应的列不存在
+            current_choices_key = key_mapping.get("input_choices_key")
+            if not current_choices_key or (isinstance(current_choices_key, str) and current_choices_key not in df.columns):
+                # 尝试推断是否为 Bool/Binary 任务
+                # 简单启发式：检查 label 列是否存在，且值域是否类似 0/1 或 False/True
+                # 为了安全，我们只对明确缺失 choices 的情况注入 ["False", "True"]
+                # 这是一个合理的默认值，即便对于 Yes/No 任务，通常也是映射到 False/True 的
+                if "choices" not in df.columns:
+                    df["choices"] = [["False", "True"]] * len(df)
+                    key_mapping["input_choices_key"] = "choices"
+                    log.info(f"[{bench_name}] Auto-injected default choices ['False', 'True'] for key3_q_choices_a")
+        
+        return df, key_mapping
+
     def run_eval(self, bench: BenchInfo, model_config: ModelConfig) -> Dict[str, Any]:
         """
         执行单个 Bench 的评测
@@ -99,6 +133,27 @@ class DataFlowEvalTool:
 
         # 4. 准备参数映射
         key_mapping = bench.meta.get("key_mapping", {})
+        log.info(f"[{bench.bench_name}] Initial Key Mapping: {key_mapping}")
+        
+        # === Ad-hoc 预处理 ===
+        # 读取初始数据，进行必要的列注入，然后写回
+        try:
+            # 直接读取原始文件，而不是通过 storage.read (因为它要求先 step)
+            # 假设 dataset_cache 是 jsonl
+            df = pd.read_json(bench.dataset_cache, lines=True)
+            df, key_mapping = self._preprocess_dataframe(
+                df, 
+                bench.bench_name, 
+                key_mapping, 
+                cache_path=bench.dataset_cache,
+                eval_type=bench.bench_dataflow_eval_type
+            )
+            # 写回作为 step_0 (这将推进 storage 的 step 计数)
+            storage.write(df)
+        except Exception as e:
+            log.error(f"[{bench.bench_name}] 预处理失败: {e}")
+            log.error(traceback.format_exc())
+            # 如果预处理失败，我们继续尝试，也许不需要预处理也能跑
         
         # 提取关键字段名
         q_key = key_mapping.get("input_question_key")
@@ -108,6 +163,14 @@ class DataFlowEvalTool:
         target_key = key_mapping.get("input_target_key")
         targets_key = key_mapping.get("input_targets_key")
         choices_key = key_mapping.get("input_choices_key")
+        
+        # 强制 choices_key 为 string（如果它是 list）
+        if isinstance(choices_key, list):
+            # 如果预处理中的合并失败了（比如列不存在），我们只能取第一个作为最后的挣扎，或者直接报错
+            # 这里选择保留之前的防御逻辑，但加上警告，表明这是不正常的状态
+            log.warning(f"[{bench.bench_name}] input_choices_key is still list {choices_key} after preprocessing. Using first element.")
+            choices_key = choices_key[0]
+
         label_key = key_mapping.get("input_label_key")
         labels_key = key_mapping.get("input_labels_key")
         better_key = key_mapping.get("input_better_key")
@@ -132,14 +195,21 @@ class DataFlowEvalTool:
         )
 
         log.info(f"[{bench.bench_name}] Running Step 1: Generator ({bench.bench_dataflow_eval_type})")
-        generator.run(
-            storage=storage.step(),
-            input_question_key=q_key,
-            input_context_key=ctx_key,
-            input_text_key=text_key, # text_score 用
-            input_choices_key=choices_key, # 有些生成任务可能需要选项进 prompt
-            output_key="generated_ans",
-        )
+        try:
+            generator.run(
+                storage=storage.step(),
+                input_question_key=q_key,
+                input_context_key=ctx_key,
+                input_text_key=text_key, # text_score 用
+                input_choices_key=choices_key, # 有些生成任务可能需要选项进 prompt
+                output_key="generated_ans",
+            )
+        except Exception as e:
+            log.error(f"[{bench.bench_name}] Generator failed: {e}")
+            log.error(traceback.format_exc())
+            # 强制重置 serving，防止脏状态
+            self.llm_serving = None
+            raise e
 
         # 6. Step 2: Evaluator
         evaluator = UnifiedBenchDatasetEvaluator(
@@ -170,10 +240,17 @@ class DataFlowEvalTool:
             "input_better_key": better_key,
             "input_rejected_key": rejected_key,
         }
-        # 过滤 None
-        eval_kwargs = {k: v for k, v in eval_kwargs.items() if v is not None}
+        # 过滤 None 和 空字符串
+        eval_kwargs = {k: v for k, v in eval_kwargs.items() if v}
         
-        evaluator.run(**eval_kwargs)
+        try:
+            evaluator.run(**eval_kwargs)
+        except Exception as e:
+            log.error(f"[{bench.bench_name}] Evaluator failed: {e}")
+            log.error(traceback.format_exc())
+            # Evaluator 失败通常不涉及 serving 状态，但为了保险起见
+            self.llm_serving = None
+            raise e
 
         # 7. 获取结果
         # step2 产生的文件是包含完整数据的
@@ -195,7 +272,6 @@ class DataFlowEvalTool:
         stats = {}
         if os.path.exists(eval_result_path):
             try:
-                import pandas as pd
                 stats_df = pd.read_json(eval_result_path)
                 if not stats_df.empty:
                     stats = stats_df.iloc[0].to_dict()

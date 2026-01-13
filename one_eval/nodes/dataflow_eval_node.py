@@ -85,10 +85,34 @@ class DataFlowEvalNode(BaseNode):
                 if not bench.meta:
                     bench.meta = {}
                 
-                bench.meta["eval_result"] = result["stats"]
+                stats = result["stats"]
+                bench.meta["eval_result"] = stats
                 bench.meta["eval_detail_path"] = result["detail_path"]
                 bench.eval_status = "success"
                 
+                # 5. 异常检测 (Zero Score Anomaly)
+                # 如果总样本数 > 0，但准确率/得分 为 0 (或 valid_samples 为 0)，可能是 Test Set 无标签
+                total_samples = stats.get("total_samples", 0)
+                accuracy = stats.get("accuracy", 0)
+                score = stats.get("score", 0)
+                valid_samples = stats.get("valid_samples", 0)
+                
+                # 简单的启发式规则：如果有样本，但得分为0
+                if total_samples > 0 and (accuracy == 0 and score == 0):
+                    is_abnormal = True
+                    reason = "Score is 0. Possibly a hidden test set without public labels."
+                    
+                    # 如果 valid_samples 也是 0，那更说明没有有效评估
+                    if valid_samples == 0:
+                        reason += " (No valid samples found for evaluation)"
+                    
+                    bench.meta["eval_abnormality"] = {
+                        "is_abnormal": True,
+                        "reason": reason,
+                        "type": "zero_score"
+                    }
+                    self.logger.warning(f"[{bench.bench_name}] Detected abnormality: {reason}")
+
                 self.logger.info(f"[{bench.bench_name}] 评测完成。Stats: {result['stats']}")
 
             except Exception as e:
