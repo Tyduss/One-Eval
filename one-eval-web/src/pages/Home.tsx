@@ -2,11 +2,100 @@ import { motion } from "framer-motion";
 import { Link } from "react-router-dom";
 import { ArrowRight, Activity, Zap, Layers } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { useCallback } from "react";
+import Particles from "react-tsparticles";
+import { loadSlim } from "tsparticles-slim";
+import type { Engine } from "tsparticles-engine";
 
 export const Home = () => {
+  const particlesInit = useCallback(async (engine: Engine) => {
+    await loadSlim(engine);
+  }, []);
+
   return (
     <div className="h-screen w-full bg-white flex flex-col font-['Inter'] overflow-hidden relative">
       
+      {/* Particles Background */}
+      <div className="absolute inset-0 z-0">
+      <Particles
+        id="tsparticles"
+        init={particlesInit}
+        className="w-full h-full"
+        options={{
+          background: {
+            color: {
+              value: "transparent",
+            },
+          },
+          fpsLimit: 120,
+          interactivity: {
+            events: {
+              onClick: {
+                enable: true,
+                mode: "push",
+              },
+              onHover: {
+                enable: true,
+                mode: "grab",
+              },
+              resize: true,
+            },
+            modes: {
+              push: {
+                quantity: 4,
+              },
+              grab: {
+                distance: 140,
+                links: {
+                  opacity: 0.5,
+                  color: "#2563eb", // blue-600
+                },
+              },
+            },
+          },
+          particles: {
+            color: {
+              value: "#94a3b8", // slate-400
+            },
+            links: {
+              color: "#cbd5e1", // slate-300
+              distance: 150,
+              enable: true,
+              opacity: 0.3,
+              width: 1,
+            },
+            move: {
+              direction: "none",
+              enable: true,
+              outModes: {
+                default: "bounce",
+              },
+              random: false,
+              speed: 1,
+              straight: false,
+            },
+            number: {
+              density: {
+                enable: true,
+                area: 800,
+              },
+              value: 80,
+            },
+            opacity: {
+              value: 0.5,
+            },
+            shape: {
+              type: "circle",
+            },
+            size: {
+              value: { min: 1, max: 3 },
+            },
+          },
+          detectRetina: true,
+        }}
+      />
+      </div>
+
       {/* Subtle Grid Background */}
       <div className="absolute inset-0 bg-[linear-gradient(to_right,#f0f0f0_1px,transparent_1px),linear-gradient(to_bottom,#f0f0f0_1px,transparent_1px)] bg-[size:4rem_4rem] [mask-image:radial-gradient(ellipse_60%_50%_at_50%_0%,#000_70%,transparent_100%)] pointer-events-none" />
 

@@ -2,7 +2,6 @@
 import asyncio
 import uuid
 import json
-import logging
 import os
 from pathlib import Path
 from typing import Dict, Any, Optional, List
@@ -12,25 +11,55 @@ import requests
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from one_eval.logger import get_logger
 
-from one_eval.graph.workflow_all import build_complete_workflow
-from one_eval.utils.checkpoint import get_checkpointer
-from one_eval.core.state import NodeState, ModelConfig
-from one_eval.utils.deal_json import _save_state_json
-from langgraph.types import Command
+log = get_logger("OneEval-Server")
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("OneEval-Server")
-
+# === Early Environment Setup ===
+# Must be done before importing langgraph/transformers/etc. to ensure env vars take effect
 SERVER_DIR = Path(__file__).resolve().parent
 DATA_DIR = SERVER_DIR / "_data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-
 CONFIG_FILE = DATA_DIR / "config.json"
 MODELS_FILE = DATA_DIR / "models.json"
+# SERVER_DIR is .../one_eval/server
+# parents[0]=one_eval, parents[1]=One-Eval (Repo Root)
+REPO_ROOT = SERVER_DIR.parents[1]
+ENV_FILE = REPO_ROOT / "env.sh"
+
+# Original DB location was parents[2] (scy/checkpoints)
+# We keep it there or move it? 
+# If previous code used parents[2], we should respect it to find existing DB.
 DB_PATH = (SERVER_DIR.parents[2] / "checkpoints" / "eval.db").resolve()
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+def _load_env_file():
+    """Parse env.sh and set os.environ if not already set."""
+    if not ENV_FILE.exists():
+        return
+    
+    log.info(f"Loading env from {ENV_FILE}")
+    content = ENV_FILE.read_text()
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Support 'export KEY=VALUE' or 'KEY=VALUE'
+        if line.startswith("export "):
+            line = line[7:].strip()
+        
+        if "=" in line:
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            # Only set if not already set (allow shell override) or force?
+            # User wants to avoid export, so we should set it if missing.
+            # But if config.json exists, it might override later.
+            if key not in os.environ and val:
+                os.environ[key] = val
+                log.info(f"Set {key} from env.sh")
+
+_load_env_file()
 
 def _load_json_file(path: Path, default: Any) -> Any:
     try:
@@ -38,24 +67,37 @@ def _load_json_file(path: Path, default: Any) -> Any:
             return default
         return json.loads(path.read_text())
     except Exception:
+        log.error(f"Error loading {path}: ", exc_info=True)
         return default
 
 def _write_json_file(path: Path, data: Any) -> None:
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    try:
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    except Exception:
+        log.error(f"Error writing {path}: ", exc_info=True)
 
 def load_server_config() -> Dict[str, Any]:
     cfg = _load_json_file(CONFIG_FILE, default={})
     if not isinstance(cfg, dict):
         cfg = {}
+        
+    # Merge env.sh defaults if config is empty
+    # (Optional, but good for first run)
+    
     hf = cfg.get("hf")
     if not isinstance(hf, dict):
         hf = {}
     endpoint = hf.get("endpoint")
     if not isinstance(endpoint, str) or not endpoint.strip():
-        endpoint = "https://hf-mirror.com"
+        # Fallback to env or default
+        endpoint = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com")
     token = hf.get("token")
     if token is not None and (not isinstance(token, str) or not token.strip()):
         token = None
+    # If token missing in config, maybe check env?
+    if not token and os.environ.get("HF_TOKEN"):
+         token = os.environ.get("HF_TOKEN")
+         
     cfg["hf"] = {"endpoint": endpoint, "token": token}
 
     agent = cfg.get("agent")
@@ -66,13 +108,16 @@ def load_server_config() -> Dict[str, Any]:
         provider = "openai_compatible"
     base_url = agent.get("base_url")
     if not isinstance(base_url, str) or not base_url.strip():
-        base_url = "http://123.129.219.111:3000/v1"
+        base_url = os.environ.get("DF_API_BASE_URL", "http://123.129.219.111:3000/v1")
     model = agent.get("model")
     if not isinstance(model, str) or not model.strip():
-        model = "gpt-4o"
+        model = os.environ.get("DF_MODEL_NAME", "gpt-4o")
     api_key = agent.get("api_key")
     if api_key is not None and (not isinstance(api_key, str) or not api_key.strip()):
         api_key = None
+    if not api_key and os.environ.get("OE_API_KEY"):
+        api_key = os.environ.get("OE_API_KEY")
+
     agent_timeout_s = agent.get("timeout_s")
     if not isinstance(agent_timeout_s, int) or agent_timeout_s <= 0:
         agent_timeout_s = 15
@@ -124,33 +169,26 @@ def apply_agent_env_from_config(cfg: Dict[str, Any]) -> None:
     if isinstance(model, str) and model.strip():
         os.environ["DF_MODEL_NAME"] = model.strip()
 
+# Initialize Env ASAP
 _cfg0 = load_server_config()
+log.info(f"Loaded server config: {_cfg0}")
 if not CONFIG_FILE.exists():
     save_server_config(_cfg0)
 apply_hf_env_from_config(_cfg0)
 apply_agent_env_from_config(_cfg0)
 
+from one_eval.graph.workflow_all import build_complete_workflow
+from one_eval.utils.checkpoint import get_checkpointer
+from one_eval.core.state import NodeState, ModelConfig, BenchInfo
+from one_eval.utils.deal_json import _save_state_json
+from langgraph.types import Command
+from one_eval.utils.bench_registry import BenchRegistry
+
+# Bench Registry
+BENCH_CONFIG_PATH = REPO_ROOT / "one_eval" / "utils" / "bench_table" / "bench_config.json"
+bench_registry = BenchRegistry(str(BENCH_CONFIG_PATH))
+
 # Models
-class StartWorkflowRequest(BaseModel):
-    user_query: str
-    target_model_name: str
-    target_model_path: str
-    tensor_parallel_size: int = 1
-    max_tokens: int = 2048
-
-class ResumeWorkflowRequest(BaseModel):
-    thread_id: str
-    action: str = "approved"  # or "rejected", etc.
-    feedback: Optional[str] = None
-    selected_benches: Optional[List[str]] = None
-
-class WorkflowStatusResponse(BaseModel):
-    thread_id: str
-    status: str # "running", "interrupted", "completed", "failed", "idle"
-    current_node: Optional[str] = None
-    state_values: Optional[Dict[str, Any]] = None
-    next_node: Optional[str] = None
-
 class HFConfigResponse(BaseModel):
     endpoint: str
     token_set: bool
@@ -289,86 +327,140 @@ def update_agent_config(req: AgentConfigUpdateRequest):
         "timeout_s": timeout_s,
     }
 
+class AgentTestRequest(BaseModel):
+    provider: Optional[str] = None
+    base_url: Optional[str] = None
+    model: Optional[str] = None
+    api_key: Optional[str] = None
+    timeout_s: Optional[int] = None
+
+import httpx
+
 @app.post("/api/config/agent/test", response_model=AgentTestResponse)
-def test_agent_config():
+async def test_agent_config(req: Optional[AgentTestRequest] = None):
     cfg = load_server_config()
     agent = cfg.get("agent") or {}
-    base_url = _normalize_openai_base_url(agent.get("base_url") or "")
+    
+    base_url = agent.get("base_url") or ""
+    if req and req.base_url and req.base_url.strip():
+        base_url = req.base_url.strip()
+    base_url = _normalize_openai_base_url(base_url)
+
     api_key = agent.get("api_key")
+    if req and req.api_key is not None:
+        api_key = req.api_key.strip()
+    
     model = agent.get("model") or "gpt-4o"
+    if req and req.model and req.model.strip():
+        model = req.model.strip()
+
     timeout_s = int(agent.get("timeout_s") or 15)
+    if req and req.timeout_s and req.timeout_s > 0:
+        timeout_s = req.timeout_s
 
     headers: Dict[str, str] = {"Content-Type": "application/json"}
     if isinstance(api_key, str) and api_key.strip():
         headers["Authorization"] = f"Bearer {api_key.strip()}"
 
-    try:
-        r = requests.get(f"{base_url}/models", headers=headers, timeout=timeout_s)
-        if r.status_code == 200:
-            return {"ok": True, "status_code": 200, "detail": "GET /models ok", "mode": "models"}
-    except Exception as e:
-        pass
+    async with httpx.AsyncClient(timeout=timeout_s) as client:
+        try:
+            r = await client.get(f"{base_url}/models", headers=headers)
+            if r.status_code == 200:
+                return {"ok": True, "status_code": 200, "detail": "GET /models ok", "mode": "models"}
+        except Exception:
+            pass
 
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": "ping"}],
-        "max_tokens": 1,
-        "temperature": 0,
-    }
-    try:
-        r = requests.post(f"{base_url}/chat/completions", headers=headers, json=payload, timeout=timeout_s)
-        if 200 <= r.status_code < 300:
-            return {"ok": True, "status_code": r.status_code, "detail": "POST /chat/completions ok", "mode": "chat"}
-        if r.status_code in (401, 403):
-            return {"ok": False, "status_code": r.status_code, "detail": "reachable but unauthorized (check API key)", "mode": "chat"}
-        return {"ok": False, "status_code": r.status_code, "detail": f"request failed: {r.text[:200]}", "mode": "chat"}
-    except Exception as e:
-        return {"ok": False, "status_code": None, "detail": f"connection error: {e}", "mode": "chat"}
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": "ping"}],
+        }
+        
+        try:
+            r = await client.post(f"{base_url}/chat/completions", headers=headers, json=payload)
+            if 200 <= r.status_code < 300:
+                return {"ok": True, "status_code": r.status_code, "detail": "POST /chat/completions ok", "mode": "chat"}
+            
+            try:
+                err_detail = r.json()
+            except:
+                err_detail = r.text[:200]
+                
+            if r.status_code in (401, 403):
+                return {"ok": False, "status_code": r.status_code, "detail": f"Unauthorized: {err_detail}", "mode": "chat"}
+            
+            return {"ok": False, "status_code": r.status_code, "detail": f"Request failed: {err_detail}", "mode": "chat"}
+        except Exception as e:
+            return {"ok": False, "status_code": None, "detail": f"Connection error: {e}", "mode": "chat"}
+
+class StartWorkflowRequest(BaseModel):
+    user_query: str
+    target_model_name: str
+    target_model_path: str
+    tensor_parallel_size: int = 1
+    max_tokens: int = 2048
+
+class ResumeWorkflowRequest(BaseModel):
+    thread_id: str
+    action: str = "approved"  # or "rejected", etc.
+    feedback: Optional[str] = None
+    selected_benches: Optional[List[str]] = None
+    state_updates: Optional[Dict[str, Any]] = None # For manual config modifications
+
+class WorkflowStatusResponse(BaseModel):
+    thread_id: str
+    status: str # "running", "interrupted", "completed", "failed", "idle"
+    current_node: Optional[str] = None
+    state_values: Optional[Dict[str, Any]] = None
+    next_node: Optional[str] = None
+
+class HistoryItem(BaseModel):
+    thread_id: str
+    updated_at: str
+    user_query: Optional[str] = None
+    status: str
+
+# ... (Previous imports)
 
 @app.post("/api/workflow/start")
 async def start_workflow(req: StartWorkflowRequest):
     thread_id = str(uuid.uuid4())
-    logger.info(f"Starting workflow for thread_id={thread_id}")
+    log.info(f"Starting workflow for thread_id={thread_id}")
 
     # Initialize State
     initial_state = NodeState(
         user_query=req.user_query,
-        target_model=req.target_model_name,
-        target_model_config=ModelConfig(
+        target_model_name=req.target_model_name,
+        target_model=ModelConfig(
             model_name_or_path=req.target_model_path,
             tensor_parallel_size=req.tensor_parallel_size,
             max_tokens=req.max_tokens
         )
     )
-
-    # We launch the workflow in background? 
-    # LangGraph is async. We can start it and let it run until first interrupt or end.
-    # But since we need to persist state, we should run it.
-    
-    # Issue: ainvoke waits until end. We need non-blocking execution or just start it.
-    # For a web server, we usually want to trigger the run and return immediately.
-    # We'll use a background task wrapper.
     
     asyncio.create_task(run_graph_background(thread_id, initial_state))
     
     return {"thread_id": thread_id, "status": "started"}
 
 async def run_graph_background(thread_id: str, input_state: Any, resume_command: Optional[Command] = None):
+    # Ensure env is fresh (though we set it at top level, dynamic updates might need this)
     apply_hf_env_from_config(load_server_config())
     apply_agent_env_from_config(load_server_config())
+    
     async with get_checkpointer(DB_PATH, mode="run") as checkpointer:
         graph = build_complete_workflow(checkpointer=checkpointer)
         config = {"configurable": {"thread_id": thread_id}}
         
         try:
-            logger.info(f"Invoking graph for {thread_id}")
+            log.info(f"Invoking graph for {thread_id}")
             if resume_command:
+                # If resume_command is passed, we assume state updates were handled before calling this if needed
+                # But wait, resume_workflow calls this.
                 await graph.ainvoke(resume_command, config=config)
             else:
                 await graph.ainvoke(input_state, config=config)
-            logger.info(f"Graph execution finished for {thread_id}")
+            log.info(f"Graph execution finished for {thread_id}")
         except Exception as e:
-            logger.error(f"Error executing graph for {thread_id}: {e}")
+            log.error(f"Error executing graph for {thread_id}: {e}")
 
 @app.get("/api/workflow/status/{thread_id}")
 async def get_status(thread_id: str):
@@ -388,47 +480,97 @@ async def get_status(thread_id: str):
         next_nodes = snap.next
         current_values = snap.values
         
-        # LangGraph state:
-        # If next is empty and we have values, it might be done.
-        # If next has value, it is waiting (e.g. interrupt) or ready to run next step?
-        # With interrupts, graph stops.
-        
         status = "running"
         if not next_nodes:
             status = "completed"
-        elif "HumanReviewNode" in next_nodes: # Or whatever the interrupt node name is logic-wise
-            # Our HumanReviewNode is an InterruptNode. 
-            # If the graph stopped *before* it? Or *at* it?
-            # InterruptNode raises NodeInterrupt. LangGraph catches it and stops.
-            # The next node to run would be the one *after* interrupt? 
-            # Actually, standard LangGraph interrupt logic:
-            # If we use `interrupt_before=["HumanReviewNode"]`, next would be HumanReviewNode.
-            # But our InterruptNode implementation inside `one_eval` likely returns a Command or uses checkpointer to pause?
-            # Let's assume if we are stopped, we check tasks.
+        elif "HumanReviewNode" in next_nodes: 
             status = "interrupted"
 
         return {
             "thread_id": thread_id,
             "status": status,
             "next_node": next_nodes,
-            "state_values": current_values # Be careful with size
+            "state_values": current_values
         }
 
 @app.post("/api/workflow/resume/{thread_id}")
 async def resume_workflow(req: ResumeWorkflowRequest):
-    # Depending on how InterruptNode is implemented.
-    # If it uses standard LangGraph interrupts, we resume with Command or update state.
-    # Based on workflow_all.py:
-    # out = await graph.ainvoke(Command(resume="approved"), config=config)
-    
-    command = Command(resume=req.action) # Assuming value is what InterruptNode expects
-    
-    # If user modified selected benches, we might need to update state *before* resuming?
-    # Or pass it in resume value?
-    # For now, let's assume we just approve.
+    # Apply state updates if provided
+    if req.state_updates:
+        # Deserialize nested objects if needed
+        if "benches" in req.state_updates and isinstance(req.state_updates["benches"], list):
+            # Convert dicts back to BenchInfo objects
+            benches_data = req.state_updates["benches"]
+            req.state_updates["benches"] = [
+                BenchInfo(**b) if isinstance(b, dict) else b 
+                for b in benches_data
+            ]
+
+        async with get_checkpointer(DB_PATH, mode="run") as checkpointer:
+            graph = build_complete_workflow(checkpointer=checkpointer)
+            config = {"configurable": {"thread_id": req.thread_id}}
+            log.info(f"Applying state updates for {req.thread_id}: {req.state_updates.keys()}")
+            await graph.aupdate_state(config, req.state_updates)
+
+    command = Command(resume=req.action)
     
     asyncio.create_task(run_graph_background(req.thread_id, None, resume_command=command))
     return {"status": "resuming"}
+
+@app.get("/api/workflow/history", response_model=List[HistoryItem])
+async def get_history():
+    import aiosqlite
+    import datetime
+    
+    if not DB_PATH.exists():
+        return []
+        
+    items = []
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Query distinct thread_ids from checkpoints
+            # Schema usually: thread_id, checkpoint_id, checkpoint, metadata...
+            # We want the latest checkpoint for each thread.
+            # But LangGraph 0.2 schema might differ.
+            # Usually 'checkpoints' table has 'thread_id'.
+            
+            # Simple query to get unique threads
+            cursor = await db.execute("SELECT DISTINCT thread_id FROM checkpoints ORDER BY thread_id DESC LIMIT 50")
+            rows = await cursor.fetchall()
+            
+            for (tid,) in rows:
+                # Get latest state for this thread to find query/status
+                async with get_checkpointer(DB_PATH, mode="run") as cp:
+                    graph = build_complete_workflow(checkpointer=cp)
+                    cfg = {"configurable": {"thread_id": tid}}
+                    try:
+                        snap = await graph.aget_state(cfg)
+                        if snap and snap.values:
+                            q = snap.values.get("user_query", "Unknown Query")
+                            # Determine status
+                            status = "completed"
+                            if snap.next:
+                                status = "interrupted" if "HumanReviewNode" in snap.next else "running"
+                            # If no next and no error -> completed
+                            
+                            ts = snap.metadata.get("created_at") if snap.metadata else None
+                            # If not in metadata, use current time or skip
+                            date_str = ts or datetime.datetime.now().isoformat()
+                            
+                            items.append(HistoryItem(
+                                thread_id=tid,
+                                updated_at=str(date_str),
+                                user_query=str(q),
+                                status=status
+                            ))
+                    except Exception:
+                        pass
+    except Exception as e:
+        log.error(f"Error fetching history: {e}")
+        return []
+        
+    return items
+
 
 @app.get("/api/models")
 def get_models():
@@ -443,6 +585,10 @@ def add_model(model: Dict[str, Any]):
     models.append(model)
     _write_json_file(MODELS_FILE, models)
     return {"status": "success"}
+
+@app.get("/api/benches/gallery")
+def get_bench_gallery():
+    return bench_registry.get_all_benches()
 
 if __name__ == "__main__":
     import uvicorn

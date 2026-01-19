@@ -1,117 +1,36 @@
 import { useState, useEffect, useMemo } from "react";
 import axios from "axios";
-import { motion, AnimatePresence } from "framer-motion";
-import { Send, Settings, Loader2, Check } from "lucide-react";
+import { motion } from "framer-motion";
+import { 
+    Clock, X, Search, Database, Play, Save, Layers, Plus, BookOpen, Trash2, AlertTriangle
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
+import { ChatPanel, WorkflowBlock, SummaryPanel, Bench, WorkflowState, BenchCard, GalleryModal } from "./EvalComponents";
 
 // --- Types ---
-interface Bench {
-  bench_name: string;
-  eval_type?: string;
-  meta?: any;
-  eval_status?: string;
-}
-
-interface WorkflowState {
-  user_query: string;
-  benches: Bench[];
-  target_model: string;
-}
-
 interface StatusResponse {
-  status: "idle" | "running" | "interrupted" | "completed" | "failed";
+  thread_id: string;
+  status: "idle" | "running" | "interrupted" | "completed" | "failed" | "not_found";
   next_node: string[] | null;
   state_values: WorkflowState | null;
+  current_node?: string; 
 }
 
-// --- Node Component (Horizontal) ---
-const NodeStep = ({ 
-    label, 
-    status, 
-    isLast 
-}: { 
-    label: string; 
-    status: "pending" | "running" | "completed" | "error";
-    isLast?: boolean;
-}) => {
-    return (
-        <div className="flex items-center">
-            {/* Node Circle */}
-            <div className="relative flex flex-col items-center group">
-                <div className={cn(
-                    "w-8 h-8 rounded-full flex items-center justify-center border-2 transition-all duration-300 z-10",
-                    status === "completed" ? "bg-slate-900 border-slate-900 text-white" :
-                    status === "running" ? "bg-white border-blue-500 text-blue-500 shadow-[0_0_0_4px_rgba(59,130,246,0.1)]" :
-                    "bg-white border-slate-200 text-slate-300"
-                )}>
-                    {status === "completed" ? <Check className="w-4 h-4" /> : 
-                     status === "running" ? <div className="w-2 h-2 bg-current rounded-full animate-ping" /> :
-                     <div className="w-2 h-2 bg-current rounded-full" />
-                    }
-                </div>
-                <span className={cn(
-                    "absolute top-10 text-xs font-medium whitespace-nowrap transition-colors",
-                    status === "pending" ? "text-slate-400" : "text-slate-700"
-                )}>
-                    {label}
-                </span>
-            </div>
+interface HistoryItem {
+    thread_id: string;
+    updated_at: string;
+    user_query: string;
+    status: string;
+}
 
-            {/* Connector Line */}
-            {!isLast && (
-                <div className={cn(
-                    "h-[2px] w-12 mx-2 transition-colors duration-500",
-                    status === "completed" ? "bg-slate-900" : "bg-slate-100"
-                )} />
-            )}
-        </div>
-    );
-};
-
-
-// --- Workflow Card Component ---
-const WorkflowCard = ({ 
-  title, 
-  isActive, 
-  status,
-  children,
-}: { 
-  title: string; 
-  isActive: boolean; 
-  status: "pending" | "running" | "completed";
-  children: React.ReactNode;
-}) => {
-  return (
-    <motion.div
-      layout
-      className={cn(
-        "bg-white rounded-2xl border transition-all duration-500 overflow-hidden flex flex-col",
-        isActive 
-          ? "border-slate-300 shadow-xl shadow-slate-200/50 min-h-[300px]" 
-          : "border-slate-100 shadow-sm opacity-60 min-h-[100px]"
-      )}
-    >
-      <div className="px-6 py-4 border-b border-slate-50 bg-slate-50/50 flex justify-between items-center">
-        <h3 className="text-sm font-bold text-slate-900 uppercase tracking-wider flex items-center gap-2">
-            <div className={cn(
-                "w-2 h-2 rounded-full",
-                status === "completed" ? "bg-green-500" :
-                status === "running" ? "bg-blue-500 animate-pulse" :
-                "bg-slate-300"
-            )} />
-            {title}
-        </h3>
-        {isActive && <Settings className="w-4 h-4 text-slate-400 cursor-pointer hover:text-slate-700" />}
-      </div>
-      
-      <div className="p-6 flex-1 flex flex-col justify-center">
-        {children}
-      </div>
-    </motion.div>
-  );
-};
+interface ChatMessage {
+    id: string;
+    role: "user" | "ai" | "system";
+    content: string | React.ReactNode;
+    timestamp: number;
+}
 
 export const Eval = () => {
   const [query, setQuery] = useState("");
@@ -119,269 +38,647 @@ export const Eval = () => {
   const [status, setStatus] = useState<StatusResponse["status"]>("idle");
   const [state, setState] = useState<WorkflowState | null>(null);
   const [currentNode, setCurrentNode] = useState<string | null>(null);
+  
+  // History
+  const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [showHistory, setShowHistory] = useState(false);
+  
+  // UI State
+  const [activeNode, setActiveNode] = useState<string | null>(null);
+  const [isGalleryOpen, setIsGalleryOpen] = useState(false);
+  const [isResuming, setIsResuming] = useState(false); // Flag to prevent polling overwrites during resume
+  const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
+  
+  // Chat State
+  const [messages, setMessages] = useState<ChatMessage[]>([
+      { id: "init", role: "ai", content: "Hello! Describe your evaluation task to get started.", timestamp: Date.now() }
+  ]);
+
+  // Editable State (for manual modification)
+  const [editBenches, setEditBenches] = useState<Bench[]>([]);
 
   const apiBaseUrl = useMemo(() => localStorage.getItem("oneEval.apiBaseUrl") || "http://localhost:8000", []);
   
+  // Fetch History
+  const fetchHistory = async () => {
+      try {
+          const res = await axios.get(`${apiBaseUrl}/api/workflow/history`);
+          setHistory(Array.isArray(res.data) ? res.data : []);
+      } catch (e) {
+          console.error("Failed to fetch history", e);
+          setHistory([]);
+      }
+  };
+
+  useEffect(() => {
+      fetchHistory();
+  }, [apiBaseUrl, status]); 
+
   // Polling
   useEffect(() => {
-    if (!threadId || status === "completed" || status === "failed") return;
+    if (!threadId || status === "completed" || status === "failed" || isResuming) return;
 
     const interval = setInterval(async () => {
       try {
         const res = await axios.get(`${apiBaseUrl}/api/workflow/status/${threadId}`);
         const data: StatusResponse = res.data;
         
+        // Status Transition Logic for Chat
+        if (data.status !== status) {
+            if (data.status === "completed") {
+                setMessages(prev => [...prev, { id: Date.now().toString(), role: "ai", content: "Evaluation completed successfully! Check the results below.", timestamp: Date.now() }]);
+            } else if (data.status === "failed") {
+                 setMessages(prev => [...prev, { id: Date.now().toString(), role: "system", content: "Evaluation failed. Please check logs.", timestamp: Date.now() }]);
+            }
+        }
+
         setStatus(data.status);
-        if (data.state_values) setState(data.state_values);
-        if (data.next_node) setCurrentNode(data.next_node[0]);
+        if (data.state_values) {
+            setState(data.state_values);
+            // Only sync editBenches if we are NOT in interrupted mode (or first time entering)
+            // But if we are in interrupted mode, we want to keep user edits.
+            // However, if the backend adds new benches (e.g. from search), we want them.
+            // Strategy: Only sync if status changed to interrupted, or if we are not editing.
+            if (data.status === "interrupted" && status !== "interrupted") {
+                 setEditBenches(data.state_values.benches || []);
+            }
+        }
+        if (data.next_node) {
+            setCurrentNode(data.next_node[0]);
+            setActiveNode(data.next_node[0]); // Auto-highlight active node
+        }
 
       } catch (e) {
         console.error("Polling error", e);
       }
-    }, 2000); 
+    }, 1500); 
 
     return () => clearInterval(interval);
-  }, [threadId, status]);
+  }, [threadId, status, isResuming]);
 
-  const handleStart = async () => {
-    if (!query) return;
+  // Init Edit Benches when entering interrupted state (handled in polling now for better control)
+  // But also fallback here
+  useEffect(() => {
+      if (status === "interrupted" && state?.benches && editBenches.length === 0) {
+          setEditBenches(state.benches);
+      }
+  }, [status, state?.benches]);
+
+  const handleStart = async (userQuery: string) => {
+    if (!userQuery) return;
+    setQuery(userQuery);
+    
+    // Add User Message
+    setMessages(prev => [...prev, { id: Date.now().toString(), role: "user", content: userQuery, timestamp: Date.now() }]);
+
     try {
+      // Fetch default model
+      let targetModelName = "Qwen2.5-7B";
+      let targetModelPath = "/mnt/DataFlow/models/Qwen2.5-7B-Instruct";
+      try {
+        const modelsRes = await axios.get(`${apiBaseUrl}/api/models`);
+        if (modelsRes.data && modelsRes.data.length > 0) {
+            targetModelName = modelsRes.data[0].name;
+            targetModelPath = modelsRes.data[0].path;
+        }
+      } catch (e) {}
+
       const res = await axios.post(`${apiBaseUrl}/api/workflow/start`, {
-        user_query: query,
-        target_model_name: "Qwen2.5-7B", 
-        target_model_path: "/mnt/DataFlow/models/Qwen2.5-7B-Instruct" 
+        user_query: userQuery,
+        target_model_name: targetModelName, 
+        target_model_path: targetModelPath
       });
       setThreadId(res.data.thread_id);
       setStatus("running");
-      setQuery(""); 
+      
+      setMessages(prev => [...prev, { id: Date.now().toString(), role: "ai", content: "I've started the evaluation workflow. I'll analyze your query first.", timestamp: Date.now() }]);
+
     } catch (e) {
       console.error(e);
+      setMessages(prev => [...prev, { id: Date.now().toString(), role: "system", content: "Failed to start workflow. Check connection.", timestamp: Date.now() }]);
     }
   };
 
   const handleResume = async () => {
     if (!threadId) return;
+    
+    setIsResuming(true); // Lock polling
+
+    // Optimistic Update
+    if (state) {
+        setState({ ...state, benches: editBenches });
+    }
+
     try {
-      await axios.post(`${apiBaseUrl}/api/workflow/resume/${threadId}`, {
+      // Send updated benches if we edited them
+      const payload: any = {
+        thread_id: threadId,
         action: "approved",
-        selected_benches: [] 
-      });
+      };
+      
+      if (status === "interrupted") {
+          payload.state_updates = {
+              benches: editBenches
+          };
+      }
+
+      await axios.post(`${apiBaseUrl}/api/workflow/resume/${threadId}`, payload);
       setStatus("running"); 
+      setMessages(prev => [...prev, { id: Date.now().toString(), role: "ai", content: "Configuration approved. Proceeding with evaluation...", timestamp: Date.now() }]);
+      
+      // Re-enable polling after a delay to allow backend to process
+      setTimeout(() => setIsResuming(false), 3000);
+
     } catch (e) {
       console.error(e);
+      setIsResuming(false);
     }
   };
-
-  // Node Status Helper
-  const getNodeStatus = (nodeName: string) => {
-    if (currentNode === nodeName) return "running";
-    const order = [
-        "QueryUnderstandNode", "BenchSearchNode", "HumanReviewNode",
-        "DatasetStructureNode", "BenchConfigRecommendNode", "DownloadNode",
-        "DatasetKeysNode", "BenchTaskInferNode", "DataFlowEvalNode"
-    ];
-    const currIdx = order.indexOf(currentNode || "");
-    const nodeIdx = order.indexOf(nodeName);
-    if (currIdx > nodeIdx) return "completed";
-    return "pending";
+  
+  const loadHistory = (item: HistoryItem) => {
+      setThreadId(item.thread_id);
+      setStatus("idle"); 
+      setQuery(item.user_query);
+      // Reset Chat
+      setMessages([
+          { id: "init", role: "ai", content: "Loaded past session.", timestamp: Date.now() },
+          { id: "hist", role: "user", content: item.user_query, timestamp: Date.now() }
+      ]);
+      
+      axios.get(`${apiBaseUrl}/api/workflow/status/${item.thread_id}`).then(res => {
+          setStatus(res.data.status);
+          setState(res.data.state_values);
+      });
   };
 
-  const isSearchActive = ["QueryUnderstandNode", "BenchSearchNode", "HumanReviewNode"].some(n => currentNode?.includes(n));
-  const isPrepActive = ["DatasetStructureNode", "BenchConfigRecommendNode", "DownloadNode"].some(n => currentNode?.includes(n));
-  const isExecActive = ["DatasetKeysNode", "BenchTaskInferNode", "DataFlowEvalNode"].some(n => currentNode?.includes(n));
+  const handleNewTask = () => {
+      // Disconnect from current session
+      setThreadId(null);
+      
+      // Reset all states
+      setStatus("idle");
+      setQuery("");
+      setState(null);
+      setCurrentNode(null);
+      setActiveNode(null);
+      setEditBenches([]);
+      
+      // Reset Chat
+      setMessages([
+          { id: "init", role: "ai", content: "Hello! Describe your evaluation task to get started.", timestamp: Date.now() }
+      ]);
+  };
+
+  const handleDeleteHistory = async (e: React.MouseEvent, threadIdToDelete: string) => {
+      e.stopPropagation();
+      try {
+          await axios.delete(`${apiBaseUrl}/api/workflow/history/${threadIdToDelete}`);
+          setHistory(prev => prev.filter(h => h.thread_id !== threadIdToDelete));
+          setDeleteConfirmId(null);
+          
+          // If we deleted the active thread, reset
+          if (threadId === threadIdToDelete) {
+              handleNewTask();
+          }
+      } catch (err) {
+          console.error("Failed to delete history item", err);
+      }
+  };
+
+  // --- Bench Management ---
+  const handleManualAdd = () => {
+      const newBench: Bench = {
+          bench_name: "new-benchmark",
+          meta: {}
+      };
+      setEditBenches([...editBenches, newBench]);
+  };
+
+  const handleGallerySelect = (bench: any) => {
+      // Check duplicate
+      if (editBenches.some(b => b.bench_name === bench.bench_name)) return;
+      
+      const newBench: Bench = {
+          bench_name: bench.bench_name,
+          eval_type: bench.task_type?.[0] || "unknown",
+          meta: {
+              ...bench.meta,
+              tags: bench.task_type || [] // Store all task types as tags
+          }
+      };
+      setEditBenches([...editBenches, newBench]);
+      setIsGalleryOpen(false);
+  };
+
+  const handleBenchUpdate = (updatedBench: Bench, index: number) => {
+      const newBenches = [...editBenches];
+      newBenches[index] = updatedBench;
+      setEditBenches(newBenches);
+      
+      // Also update main state for immediate visual feedback if in interrupted mode
+      if (state && status === "interrupted") {
+        const newStateBenches = [...(state.benches || [])];
+        if (index < newStateBenches.length) {
+            newStateBenches[index] = updatedBench;
+            setState({ ...state, benches: newStateBenches });
+        }
+      }
+  };
   
+  // Helper to determine block status
   const getBlockStatus = (block: 'search' | 'prep' | 'exec') => {
-      if (status === 'idle') return 'pending';
+      if (status === 'idle') return 'idle';
+      
+      const nodes = currentNode ? [currentNode] : [];
+      const isSearchActive = ["QueryUnderstandNode", "BenchSearchNode", "HumanReviewNode"].some(n => nodes.some(cn => cn.includes(n)));
+      const isPrepActive = ["DatasetStructureNode", "BenchConfigRecommendNode", "BenchTaskInferNode", "DownloadNode"].some(n => nodes.some(cn => cn.includes(n)));
+      const isExecActive = ["DataFlowEvalNode"].some(n => nodes.some(cn => cn.includes(n)));
+
       if (status === 'completed') return 'completed';
       
-      if (block === 'search') return isSearchActive ? 'running' : 'completed';
-      if (block === 'prep') return isPrepActive ? 'running' : (isSearchActive ? 'pending' : 'completed');
-      if (block === 'exec') return isExecActive ? 'running' : (isSearchActive || isPrepActive ? 'pending' : 'completed');
+      if (block === 'search') {
+          if (isSearchActive) return status === "interrupted" ? "interrupted" : "running";
+          return "completed"; 
+      }
+      if (block === 'prep') {
+          if (isPrepActive) return "running";
+          if (isSearchActive) return "pending";
+          return "completed";
+      }
+      if (block === 'exec') {
+          if (isExecActive) return "running";
+          if (isSearchActive || isPrepActive) return "pending";
+          return "completed";
+      }
       return 'pending';
-  }
+  };
 
   return (
-    <div className="h-screen flex flex-col bg-slate-50 relative overflow-hidden font-['Inter']">
-       {/* Background */}
-       <div className="absolute inset-0 bg-[linear-gradient(to_right,#e2e8f0_1px,transparent_1px),linear-gradient(to_bottom,#e2e8f0_1px,transparent_1px)] bg-[size:2rem_2rem] [mask-image:radial-gradient(ellipse_60%_50%_at_50%_0%,#000_70%,transparent_100%)] pointer-events-none opacity-50" />
-       
-       {/* Top Bar */}
-       <header className="px-8 py-4 flex justify-between items-center z-20 border-b border-slate-200 bg-white/50 backdrop-blur-sm">
-         <div className="flex items-center gap-4">
-            <h2 className="font-bold text-lg text-slate-900 tracking-tight">Evaluation Workflow</h2>
-            {threadId && <span className="text-xs font-mono text-slate-400 bg-slate-100 px-2 py-1 rounded">ID: {threadId.split('-')[0]}</span>}
-         </div>
-         <div className="flex items-center gap-3">
-             {status === "running" && <Loader2 className="w-4 h-4 text-blue-600 animate-spin" />}
-             <span className={cn(
-                 "text-xs font-medium uppercase tracking-wider px-2 py-1 rounded-full",
-                 status === "running" ? "bg-blue-50 text-blue-700" :
-                 status === "completed" ? "bg-green-50 text-green-700" :
-                 "bg-slate-100 text-slate-500"
-             )}>{status}</span>
-         </div>
-       </header>
+    <div className="h-screen flex bg-slate-50 overflow-hidden font-['Inter']">
+       {/* Background Pattern */}
+       <div className="absolute inset-0 bg-[linear-gradient(to_right,#e2e8f0_1px,transparent_1px),linear-gradient(to_bottom,#e2e8f0_1px,transparent_1px)] bg-[size:2rem_2rem] [mask-image:radial-gradient(ellipse_60%_50%_at_50%_0%,#000_70%,transparent_100%)] pointer-events-none opacity-50 z-0" />
 
-       {/* Main Layout */}
-       <main className="flex-1 px-8 py-6 flex flex-col gap-6 overflow-y-auto z-10 max-w-5xl mx-auto w-full pb-32">
-         
-         {/* Block 1: Discovery */}
-         <WorkflowCard 
-            title="Discovery Phase" 
-            status={getBlockStatus('search') as any}
-            isActive={status === 'idle' || isSearchActive || status === 'interrupted'}
-         >
-             <div className="flex flex-col gap-8">
-                {/* Node Flow */}
-                <div className="flex items-center justify-center py-4">
-                    <NodeStep label="Understand" status={getNodeStatus("QueryUnderstandNode")} />
-                    <NodeStep label="Search" status={getNodeStatus("BenchSearchNode")} />
-                    <NodeStep label="Review" status={getNodeStatus("HumanReviewNode")} isLast />
-                </div>
+       {/* --- Left Sidebar (History) --- */}
+       <motion.div 
+         initial={{ width: 60, opacity: 1 }}
+         animate={{ width: showHistory ? 280 : 70 }}
+         className="bg-white border-r border-slate-200 z-50 flex flex-col shadow-[4px_0_24px_-12px_rgba(0,0,0,0.1)] transition-all duration-300 relative"
+       >
+           <div className="p-4 border-b border-slate-100 flex items-center justify-between h-16 shrink-0">
+               {showHistory ? (
+                   <div className="flex items-center gap-2 overflow-hidden">
+                       <div className="w-8 h-8 rounded-lg bg-blue-600 flex items-center justify-center text-white shadow-lg shadow-blue-500/20 shrink-0">
+                           <Clock className="w-4 h-4" />
+                       </div>
+                       <span className="font-bold text-slate-800 truncate">History</span>
+                   </div>
+               ) : (
+                   <div className="w-full flex justify-center">
+                       <div className="w-8 h-8 rounded-lg bg-slate-100 flex items-center justify-center text-slate-500 group-hover:bg-blue-50 group-hover:text-blue-600 transition-colors cursor-pointer" onClick={() => setShowHistory(true)}>
+                           <Clock className="w-5 h-5" />
+                       </div>
+                   </div>
+               )}
+               
+               {showHistory && (
+                   <Button variant="ghost" size="icon" onClick={() => setShowHistory(false)} className="h-8 w-8 text-slate-400 hover:text-slate-600">
+                       <Layers className="w-4 h-4 rotate-90" />
+                   </Button>
+               )}
+           </div>
 
-                {/* Content */}
-                <AnimatePresence mode="wait">
-                    {state?.benches?.length ? (
-                        <motion.div 
-                            initial={{ opacity: 0, y: 10 }}
-                            animate={{ opacity: 1, y: 0 }}
-                            className="bg-slate-50 border border-slate-100 rounded-xl p-4 grid grid-cols-1 md:grid-cols-2 gap-3"
-                        >
-                            {state.benches.map((b, i) => (
-                                <div key={i} className="flex items-center justify-between p-3 bg-white rounded-lg shadow-sm border border-slate-100">
-                                    <span className="font-medium text-sm text-slate-700">{b.bench_name}</span>
-                                    {status === "interrupted" && <div className="w-4 h-4 rounded-full border-2 border-blue-500 bg-blue-500" />}
-                                </div>
-                            ))}
-                        </motion.div>
-                    ) : (
-                        <div className="text-center text-slate-400 text-sm py-4 italic">
-                            Waiting for workflow to start...
-                        </div>
-                    )}
-                </AnimatePresence>
+           {/* New Task Button Area */}
+           <div className={cn("p-3", !showHistory && "flex justify-center")}>
+               <Button 
+                   variant={showHistory ? "default" : "ghost"} 
+                   size={showHistory ? "default" : "icon"}
+                   className={cn(
+                       "w-full gap-2 transition-all",
+                       showHistory ? "bg-slate-900 text-white hover:bg-slate-800 shadow-md" : "h-10 w-10 rounded-xl bg-blue-50 text-blue-600 hover:bg-blue-100"
+                   )}
+                   onClick={handleNewTask}
+                   title="Start New Task"
+               >
+                   <Plus className={cn("w-4 h-4", !showHistory && "w-5 h-5")} />
+                   {showHistory && <span>New Task</span>}
+               </Button>
+           </div>
+           
+           <div className="flex-1 overflow-y-auto p-2 space-y-2 scrollbar-hide">
+               {showHistory && Array.isArray(history) && history.map(item => {
+                   if (!item || typeof item !== 'object') return null;
+                   const safeThreadId = item.thread_id || `temp-${Math.random()}`;
+                   const safeDate = (() => {
+                       try {
+                           return item.updated_at ? new Date(item.updated_at).toLocaleTimeString() : "";
+                       } catch (e) {
+                           return "";
+                       }
+                   })();
 
-                {status === "interrupted" && (
-                    <div className="flex justify-center">
-                        <Button
-                          onClick={handleResume}
-                          className="text-white bg-gradient-to-r from-blue-600 to-violet-600 hover:from-blue-500 hover:to-violet-500 shadow-lg shadow-blue-600/20"
-                        >
-                            Approve Benchmarks & Continue
-                        </Button>
-                    </div>
-                )}
+                   return (
+                   <div 
+                        key={safeThreadId}
+                        onClick={() => loadHistory(item)}
+                        className={cn(
+                            "p-3 rounded-lg border cursor-pointer transition-all hover:shadow-md relative group",
+                            threadId === item.thread_id ? "bg-blue-50 border-blue-200" : "bg-white border-slate-100 hover:border-slate-300"
+                        )}
+                   >
+                       {/* Delete Overlay / Button */}
+                       {deleteConfirmId === safeThreadId ? (
+                           <div className="absolute inset-0 bg-white/95 z-10 flex flex-col items-center justify-center rounded-lg border border-red-100 p-2 text-center" onClick={e => e.stopPropagation()}>
+                               <span className="text-[10px] text-red-600 font-bold mb-1 flex items-center gap-1">
+                                   <AlertTriangle className="w-3 h-3" /> Confirm Delete?
+                               </span>
+                               <div className="flex gap-2 w-full">
+                                   <Button 
+                                       size="sm" 
+                                       variant="outline" 
+                                       className="h-6 flex-1 text-[10px] p-0" 
+                                       onClick={(e) => {
+                                           e.stopPropagation();
+                                           setDeleteConfirmId(null);
+                                       }}
+                                   >
+                                       Cancel
+                                   </Button>
+                                   <Button 
+                                       size="sm" 
+                                       className="h-6 flex-1 text-[10px] p-0 bg-red-500 hover:bg-red-600 text-white" 
+                                       onClick={(e) => handleDeleteHistory(e, safeThreadId)}
+                                   >
+                                       Delete
+                                   </Button>
+                               </div>
+                           </div>
+                       ) : (
+                           <Button
+                               variant="ghost"
+                               size="icon"
+                               className="absolute top-2 right-2 h-6 w-6 opacity-0 group-hover:opacity-100 transition-opacity text-slate-400 hover:text-red-500 hover:bg-red-50 z-10"
+                               onClick={(e) => {
+                                   e.stopPropagation();
+                                   setDeleteConfirmId(safeThreadId);
+                               }}
+                               title="Delete Task"
+                           >
+                               <Trash2 className="w-3 h-3" />
+                           </Button>
+                       )}
+
+                       <div className="flex justify-between items-start mb-1">
+                           <span className={cn(
+                               "text-[10px] uppercase font-bold px-1.5 py-0.5 rounded",
+                               item.status === "completed" ? "bg-green-100 text-green-700" :
+                               item.status === "interrupted" ? "bg-amber-100 text-amber-700" :
+                               "bg-slate-100 text-slate-600"
+                           )}>{item.status || "UNKNOWN"}</span>
+                           <span className="text-[10px] text-slate-400">{safeDate}</span>
+                       </div>
+                       <p className="text-xs text-slate-700 font-medium line-clamp-2 pr-4" title={item.user_query}>
+                           {item.user_query || "Untitled Task"}
+                       </p>
+                   </div>
+                   );
+               })}
+           </div>
+       </motion.div>
+
+       {/* --- Center Canvas --- */}
+       <div className="flex-1 flex flex-col relative z-10 h-full overflow-hidden">
+           
+           {/* Top Toolbar */}
+           <header className="px-6 h-16 flex justify-between items-center bg-white/80 backdrop-blur-md border-b border-slate-200 z-20">
+             <div className="flex items-center gap-2">
+                <h2 className="font-bold text-lg text-slate-900 tracking-tight flex items-center gap-2">
+                    OneEval <span className="text-blue-600">Studio</span>
+                </h2>
              </div>
-         </WorkflowCard>
-
-         {/* Block 2: Planning */}
-         <WorkflowCard 
-            title="Preparation Phase" 
-            status={getBlockStatus('prep') as any}
-            isActive={isPrepActive}
-         >
-             <div className="flex flex-col gap-8">
-                 <div className="flex items-center justify-center py-4">
-                    <NodeStep label="Analyze" status={getNodeStatus("DatasetStructureNode")} />
-                    <NodeStep label="Config" status={getNodeStatus("BenchConfigRecommendNode")} />
-                    <NodeStep label="Download" status={getNodeStatus("DownloadNode")} isLast />
-                </div>
-                
-                {state?.benches?.length && isPrepActive && (
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                        {state.benches.map((b, i) => (
-                             <div key={i} className="bg-slate-50 p-4 rounded-lg border border-slate-100">
-                                 <div className="text-xs font-bold text-slate-500 mb-2 uppercase tracking-wider">{b.bench_name}</div>
-                                 {b.meta?.key_mapping ? (
-                                     <div className="text-xs font-mono text-slate-600 bg-white p-2 rounded border border-slate-100">
-                                         {JSON.stringify(b.meta.key_mapping, null, 2)}
-                                     </div>
-                                 ) : (
-                                     <div className="flex items-center gap-2 text-xs text-blue-600">
-                                        <Loader2 className="w-3 h-3 animate-spin" /> Processing schema...
-                                     </div>
-                                 )}
-                             </div>
-                        ))}
-                    </div>
-                )}
-            </div>
-         </WorkflowCard>
-
-         {/* Block 3: Execution */}
-         <WorkflowCard 
-            title="Execution Phase" 
-            status={getBlockStatus('exec') as any}
-            isActive={isExecActive || status === 'completed'}
-         >
-             <div className="flex flex-col gap-8">
-                 <div className="flex items-center justify-center py-4">
-                    <NodeStep label="Infer Task" status={getNodeStatus("BenchTaskInferNode")} />
-                    <NodeStep label="Evaluate" status={getNodeStatus("DataFlowEvalNode")} isLast />
-                </div>
-
-                <div className="space-y-3">
-                     {state?.benches?.map((b, i) => (
-                        <div key={i} className="bg-white p-4 rounded-xl border border-slate-100 shadow-sm flex flex-col gap-4">
-                             <div className="flex justify-between items-center">
-                                 <span className="font-semibold text-slate-900">{b.bench_name}</span>
-                                 {b.eval_status === "success" && (
-                                     <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">
-                                         Completed
-                                     </span>
-                                 )}
-                             </div>
-                             
-                             {b.meta?.eval_result && (
-                                <div className="flex gap-4">
-                                    {Object.entries(b.meta.eval_result).map(([k, v]) => (
-                                        <div key={k} className="flex flex-col">
-                                            <span className="text-[10px] text-slate-400 uppercase tracking-wider font-semibold">{k}</span>
-                                            <span className="text-lg font-mono font-medium text-slate-900">{String(v)}</span>
-                                        </div>
-                                    ))}
-                                </div>
-                             )}
-                        </div>
-                     ))}
-                </div>
-            </div>
-         </WorkflowCard>
-
-       </main>
-
-       {/* Bottom Chat Area */}
-       <div className="fixed bottom-0 left-0 right-0 p-6 z-30 flex justify-center pointer-events-none">
-         <motion.div 
-            initial={{ y: 20, opacity: 0 }}
-            animate={{ y: 0, opacity: 1 }}
-            className="w-full max-w-2xl pointer-events-auto"
-         >
-            <div className="bg-white border border-slate-200 rounded-2xl flex items-center p-2 shadow-2xl shadow-slate-200/50">
-                <Input 
-                    placeholder={status === "idle" ? "Describe your evaluation task..." : "Workflow is running..."}
-                    value={query}
-                    onChange={e => setQuery(e.target.value)}
-                    disabled={status !== "idle"}
-                    className="border-0 bg-transparent focus-visible:ring-0 text-slate-900 placeholder:text-slate-400 h-12 text-lg shadow-none"
-                    onKeyDown={e => e.key === "Enter" && status === "idle" && handleStart()}
-                />
-                <Button 
-                    size="icon" 
-                    onClick={handleStart} 
-                    disabled={status !== "idle" || !query}
+             
+             <div className="flex items-center gap-3">
+                 <Button variant="outline" size="sm" className="gap-2">
+                     <Database className="w-4 h-4" /> Benches
+                 </Button>
+                 <Button variant="outline" size="sm" className="gap-2">
+                     <Layers className="w-4 h-4" /> Task
+                 </Button>
+                 <Button variant="outline" size="sm" className="gap-2">
+                     <Save className="w-4 h-4" /> Save
+                 </Button>
+                 <div className="w-px h-6 bg-slate-200 mx-1" />
+                 <Button 
+                    size="sm" 
                     className={cn(
-                        "h-10 w-10 rounded-xl transition-all shadow-sm", 
-                        query
-                          ? "text-white bg-gradient-to-r from-blue-600 to-violet-600 hover:from-blue-500 hover:to-violet-500 shadow-blue-600/20"
-                          : "bg-slate-100 text-slate-400"
+                        "gap-2 transition-all",
+                        status === "running" ? "bg-red-500 hover:bg-red-600" : "bg-blue-600 hover:bg-blue-700"
                     )}
-                >
-                    {status === "idle" ? <Send className="w-5 h-5" /> : <div className="w-2 h-2 bg-current rounded-full animate-ping" />}
-                </Button>
-            </div>
-         </motion.div>
+                 >
+                     {status === "running" ? <><X className="w-4 h-4" /> Stop</> : <><Play className="w-4 h-4" /> Run</>}
+                 </Button>
+             </div>
+           </header>
+
+           {/* Blocks Canvas */}
+           <main className="flex-1 overflow-y-auto p-8 pb-32 scroll-smooth">
+               <div className="max-w-5xl mx-auto space-y-12">
+                   
+                   {/* Block 1: Discovery */}
+                   <WorkflowBlock 
+                        title="Discovery Phase" 
+                        icon={Search}
+                        activeNodeId={activeNode}
+                        status={getBlockStatus('search') as any}
+                        colorTheme="violet"
+                        nodes={[
+                            { id: "QueryUnderstandNode", label: "Understand" },
+                            { id: "BenchSearchNode", label: "Search" },
+                            { id: "HumanReviewNode", label: "Review" }
+                        ]}
+                   >
+                       <div className="space-y-6">
+                           <div className="space-y-2">
+                               <label className="text-xs font-bold text-slate-400 uppercase tracking-wider pl-1">User Query</label>
+                               <div className="p-4 bg-slate-50/50 rounded-xl border border-slate-100 text-sm text-slate-700 shadow-inner min-h-[50px] leading-relaxed">
+                                   {query || <span className="text-slate-400 italic">Waiting for input...</span>}
+                               </div>
+                           </div>
+                           
+                           {/* Editable Benches List */}
+                           {state?.benches?.length ? (
+                               <div className="space-y-3">
+                                   <div className="flex justify-between items-center px-1">
+                                       <label className="text-xs font-bold text-slate-400 uppercase tracking-wider">Target Benchmarks</label>
+                                       {status === "interrupted" && (
+                                           <div className="flex gap-2">
+                                               <Button size="sm" variant="outline" className="h-6 px-2 text-[10px] gap-1 bg-amber-50 border-amber-200 text-amber-700 hover:bg-amber-100" onClick={handleManualAdd}>
+                                                    <Plus className="w-3 h-3" /> Add Custom
+                                               </Button>
+                                               <Button size="sm" variant="outline" className="h-6 px-2 text-[10px] gap-1 bg-blue-50 border-blue-200 text-blue-700 hover:bg-blue-100" onClick={() => setIsGalleryOpen(true)}>
+                                                    <BookOpen className="w-3 h-3" /> From Gallery
+                                               </Button>
+                                           </div>
+                                       )}
+                                   </div>
+                                   
+                                   <div className="grid grid-cols-1 gap-3">
+                                       {(status === "interrupted" ? editBenches : state.benches).map((b, i) => (
+                                           <div key={i} className={cn(
+                                               "flex items-center gap-4 p-3 rounded-xl border transition-all",
+                                               status === "interrupted" 
+                                                   ? "bg-white border-amber-200 shadow-sm shadow-amber-100" 
+                                                   : "bg-slate-50/50 border-slate-100"
+                                           )}>
+                                               <div className="w-8 h-8 rounded-lg bg-violet-100 text-violet-600 flex items-center justify-center text-xs font-bold shrink-0">
+                                                   {b.bench_name.substring(0, 2).toUpperCase()}
+                                               </div>
+                                               {status === "interrupted" ? (
+                                                   <div className="flex flex-1 items-center gap-2">
+                                                      <Input 
+                                                          placeholder="Enter benchmark name..."
+                                                          value={b.bench_name}
+                                                          onChange={(e) => {
+                                                                const nb = [...editBenches];
+                                                                nb[i].bench_name = e.target.value;
+                                                                setEditBenches(nb);
+                                                           }}
+                                                           className="h-9 text-sm border-amber-100 focus-visible:ring-amber-500 bg-amber-50/30"
+                                                       />
+                                                       <Button 
+                                                           variant="ghost" 
+                                                           size="icon" 
+                                                           className="h-9 w-9 text-amber-600 hover:bg-amber-100 hover:text-amber-700"
+                                                           onClick={() => {
+                                                               const nb = editBenches.filter((_, idx) => idx !== i);
+                                                               setEditBenches(nb);
+                                                           }}
+                                                       >
+                                                           <X className="w-4 h-4" />
+                                                       </Button>
+                                                   </div>
+                                               ) : (
+                                                   <span className="font-mono font-medium text-sm text-slate-700">{b.bench_name}</span>
+                                               )}
+                                           </div>
+                                       ))}
+                                   </div>
+                               </div>
+                           ) : null}
+                       </div>
+                   </WorkflowBlock>
+
+                   {/* Block 2: Preparation */}
+                   <WorkflowBlock 
+                        title="Preparation Phase" 
+                        icon={Database}
+                        activeNodeId={activeNode}
+                        status={getBlockStatus('prep') as any}
+                        colorTheme="amber"
+                        nodes={[
+                            { id: "DatasetStructureNode", label: "Structure" },
+                            { id: "BenchConfigRecommendNode", label: "Config" },
+                            { id: "BenchTaskInferNode", label: "Inference" },
+                            { id: "DownloadNode", label: "Download" }
+                        ]}
+                   >
+                       {/* Config View */}
+                       <div className="grid grid-cols-2 gap-4">
+                           {/* Use editBenches if interrupted to show live updates, else state.benches */}
+                           {(status === "interrupted" ? editBenches : state?.benches)?.map((b, i) => (
+                               <div key={i} className="h-48">
+                                   <BenchCard 
+                                       bench={b} 
+                                       activeNode={activeNode} 
+                                       onUpdate={(updated) => handleBenchUpdate(updated, i)}
+                                   />
+                               </div>
+                           ))}
+                           {!(state?.benches?.length || editBenches.length) && (
+                               <div className="col-span-2 py-8 flex flex-col items-center justify-center text-slate-300 border-2 border-dashed border-slate-100 rounded-xl">
+                                   <Database className="w-8 h-8 mb-2 opacity-50" />
+                                   <span className="text-sm">No benchmarks configured</span>
+                               </div>
+                           )}
+                       </div>
+                   </WorkflowBlock>
+
+                   {/* Block 3: Execution */}
+                   <WorkflowBlock 
+                        title="Execution Phase" 
+                        icon={Play}
+                        activeNodeId={activeNode}
+                        status={getBlockStatus('exec') as any}
+                        colorTheme="emerald"
+                        nodes={[
+                            { id: "DataFlowEvalNode", label: "Evaluation" }
+                        ]}
+                   >
+                       <div className="space-y-3">
+                           {state?.benches?.map((b, i) => (
+                               <div key={i} className="flex items-center justify-between p-4 bg-white rounded-xl border border-slate-100 shadow-sm">
+                                   <div className="flex items-center gap-3">
+                                       <div className={cn(
+                                           "w-2 h-8 rounded-full",
+                                           b.eval_status === "success" ? "bg-emerald-500" : "bg-slate-200"
+                                       )} />
+                                       <span className="text-sm font-bold text-slate-700">{b.bench_name}</span>
+                                   </div>
+                                   
+                                   {b.meta?.eval_result ? (
+                                       <div className="flex items-center gap-3 bg-emerald-50 px-3 py-1.5 rounded-lg border border-emerald-100">
+                                           <span className="text-xs font-bold text-emerald-600 uppercase tracking-wider">Score</span>
+                                           <span className="text-lg font-black text-emerald-700 font-mono">
+                                                {/* Metric Display Logic */}
+                                                {(() => {
+                                                    const res = b.meta.eval_result;
+                                                    const score = res.score ?? res.accuracy ?? res.exact_match ?? Object.values(res)[0];
+                                                    return typeof score === 'number' ? score.toFixed(2) : score;
+                                                })()}
+                                           </span>
+                                       </div>
+                                   ) : (
+                                       <span className="text-xs text-slate-400 italic">Waiting for results...</span>
+                                   )}
+                               </div>
+                           ))}
+                           {!state?.benches?.length && (
+                               <div className="py-8 flex flex-col items-center justify-center text-slate-300 border-2 border-dashed border-slate-100 rounded-xl">
+                                   <Play className="w-8 h-8 mb-2 opacity-50" />
+                                   <span className="text-sm">Ready to execute</span>
+                               </div>
+                           )}
+                       </div>
+                   </WorkflowBlock>
+
+               </div>
+           </main>
+           
+           {/* Bottom Summary Panel */}
+           <SummaryPanel state={state} sidebarWidth={showHistory ? 280 : 70} />
        </div>
+
+       {/* --- Right Sidebar (Chat) --- */}
+       <div className="h-full z-40 shadow-2xl relative flex-shrink-0">
+           <ChatPanel 
+                messages={messages} 
+                status={status}
+                onSendMessage={handleStart}
+                onConfirm={handleResume}
+                isWaitingForInput={status !== "idle"}
+                activeNodeId={activeNode} 
+           />
+       </div>
+
+       {/* Gallery Modal */}
+       <GalleryModal 
+            isOpen={isGalleryOpen} 
+            onClose={() => setIsGalleryOpen(false)} 
+            onSelect={handleGallerySelect}
+            apiBaseUrl={apiBaseUrl}
+       />
+
     </div>
   );
 };
+
+export default Eval;

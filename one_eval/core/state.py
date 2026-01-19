@@ -50,7 +50,7 @@ class NodeState(MainState):
     # === 用户输入 / 任务上下文 ===
     user_query: Optional[str] = None               # e.g. "评估模型在文本过滤任务的表现"
     task_domain: Optional[str] = None              # "text", "vision", "math" 等
-    target_model: Optional[str] = None             # 被测模型名或本地路径
+    target_model_name: Optional[str] = None        # 被测模型名
     model_type: Optional[str] = None              # "Qwen", "Llama", "DeepSeek"
     target_model: Optional[ModelConfig] = None
     # temp: Dict[str, Any] = field(default_factory=dict)  # 临时存储，用于中间结果
