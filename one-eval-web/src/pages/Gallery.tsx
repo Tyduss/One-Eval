@@ -11,6 +11,10 @@ import {
   SlidersHorizontal,
   Tag,
   X,
+  ExternalLink,
+  RefreshCw,
+  Loader2,
+  Plus,
 } from "lucide-react";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -18,83 +22,96 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
 
+// ============================================================================
+// Types - 匹配 bench_gallery.json 的数据结构
+// ============================================================================
+
 type BenchCategory = "Math" | "Reasoning" | "Knowledge" | "Safety" | "Coding" | "General";
 
-type BenchMeta = {
+// bench_gallery.json 中的 HF 元数据
+type HfMeta = {
+  bench_name: string;
+  hf_repo: string;
+  card_text: string;
+  tags: string[];
+  exists_on_hf: boolean;
+};
+
+// 数据集结构信息
+type DatasetStructure = {
+  repo_id: string;
+  revision: string | null;
+  subsets: Array<{
+    subset: string;
+    splits: Array<{
+      name: string;
+      num_examples: number | null;
+    }>;
+    features: Record<string, unknown> | null;
+  }>;
+  ok: boolean;
+  error: string | null;
+};
+
+// 下载配置
+type DownloadConfig = {
+  config: string;
+  split: string;
+  reason: string;
+};
+
+// 字段映射
+type KeyMapping = {
+  input_question_key: string | null;
+  input_target_key: string | null;
+  input_context_key?: string | null;
+};
+
+// bench_gallery.json 中的 meta 字段
+type BenchGalleryMeta = {
+  bench_name: string;
+  source: string;
+  aliases: string[];
   category: BenchCategory;
   tags: string[];
   description: string;
-  sampleCount?: number;
+  hf_meta: HfMeta;
+  structure?: DatasetStructure;
+  download_config?: DownloadConfig;
+  key_mapping?: KeyMapping;
+  key_mapping_reason?: string;
 };
 
+// bench_gallery.json 中的单个 bench 项
+type BenchGalleryItem = {
+  bench_name: string;
+  bench_table_exist: boolean;
+  bench_source_url: string;
+  bench_dataflow_eval_type: string;
+  bench_prompt_template: string | null;
+  bench_keys: string[];
+  meta: BenchGalleryMeta;
+};
+
+// 前端使用的简化类型（兼容旧代码）
 type BenchItem = {
   id: string;
   name: string;
-  meta: BenchMeta;
+  meta: {
+    category: BenchCategory;
+    tags: string[];
+    description: string;
+    sampleCount?: number;
+    datasetUrl?: string;
+    datasetKeys?: string[];
+  };
+  // 保留完整的原始数据
+  _raw?: BenchGalleryItem;
 };
 
-const DEFAULT_BENCHES: BenchItem[] = [
-  {
-    id: "gsm8k",
-    name: "GSM8K",
-    meta: {
-      category: "Math",
-      tags: ["Math", "Reasoning", "Arithmetic"],
-      description: "Grade school math word problems, strong for multi-step reasoning.",
-      sampleCount: 8792,
-    },
-  },
-  {
-    id: "math-500",
-    name: "MATH-500",
-    meta: {
-      category: "Math",
-      tags: ["Math", "Proof", "Algebra"],
-      description: "A curated subset for harder mathematics and structured solutions.",
-      sampleCount: 500,
-    },
-  },
-  {
-    id: "mmlu",
-    name: "MMLU",
-    meta: {
-      category: "Knowledge",
-      tags: ["Knowledge", "Multi-task", "QA"],
-      description: "Broad academic and professional knowledge across many subjects.",
-      sampleCount: 15908,
-    },
-  },
-  {
-    id: "truthfulqa",
-    name: "TruthfulQA",
-    meta: {
-      category: "Safety",
-      tags: ["Safety", "Hallucination", "Truthfulness"],
-      description: "Measures whether a model avoids common misconceptions and hallucinations.",
-      sampleCount: 817,
-    },
-  },
-  {
-    id: "humaneval",
-    name: "HumanEval",
-    meta: {
-      category: "Coding",
-      tags: ["Coding", "Python", "Unit Tests"],
-      description: "Programming problems for code generation evaluation.",
-      sampleCount: 164,
-    },
-  },
-  {
-    id: "hellaswag",
-    name: "HellaSwag",
-    meta: {
-      category: "Reasoning",
-      tags: ["Common Sense", "Reasoning", "Multiple Choice"],
-      description: "Commonsense inference and continuation selection.",
-      sampleCount: 10042,
-    },
-  },
-];
+// ============================================================================
+// Constants
+// ============================================================================
 
 const CATEGORIES: Array<{ id: BenchCategory | "All"; label: string }> = [
   { id: "All", label: "All" },
@@ -105,6 +122,10 @@ const CATEGORIES: Array<{ id: BenchCategory | "All"; label: string }> = [
   { id: "Coding", label: "Coding" },
   { id: "General", label: "General" },
 ];
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
 
 function getBenchIcon(category: BenchCategory) {
   switch (category) {
@@ -123,15 +144,41 @@ function getBenchIcon(category: BenchCategory) {
   }
 }
 
+/**
+ * 将 bench_gallery.json 的数据转换为前端使用的 BenchItem 格式
+ */
+function transformBenchGalleryItem(item: BenchGalleryItem): BenchItem {
+  const meta = item.meta || {};
+  // 从 aliases 中获取显示名称（通常第二个是大写版本）
+  const displayName = meta.aliases?.[1] || meta.aliases?.[0] || item.bench_name;
+
+  return {
+    id: item.bench_name,
+    name: displayName,
+    meta: {
+      category: meta.category || "General",
+      tags: meta.tags || [],
+      description: meta.description || "",
+      datasetUrl: item.bench_source_url,
+      datasetKeys: item.bench_keys,
+    },
+    _raw: item,
+  };
+}
+
+function getApiBaseUrl(): string {
+  return localStorage.getItem("oneEval.apiBaseUrl") || "http://localhost:8000";
+}
+
 function loadGalleryBenches(): BenchItem[] {
   try {
     const raw = localStorage.getItem("oneEval.gallery.benches");
-    if (!raw) return DEFAULT_BENCHES;
+    if (!raw) return [];
     const parsed = JSON.parse(raw) as BenchItem[];
-    if (!Array.isArray(parsed) || parsed.length === 0) return DEFAULT_BENCHES;
+    if (!Array.isArray(parsed) || parsed.length === 0) return [];
     return parsed;
   } catch {
-    return DEFAULT_BENCHES;
+    return [];
   }
 }
 
@@ -139,15 +186,77 @@ function saveGalleryBenches(items: BenchItem[]) {
   localStorage.setItem("oneEval.gallery.benches", JSON.stringify(items));
 }
 
+// ============================================================================
+// Component
+// ============================================================================
+
+// Bench 类型选项
+const BENCH_TYPES = [
+  "language & reasoning",
+  "safety",
+  "code",
+  "math",
+  "knowledge",
+  "information retrieval & RAG",
+  "agents & tools use",
+  "multimodal",
+  "other",
+];
+
 export const Gallery = () => {
   const navigate = useNavigate();
   const [benches, setBenches] = useState<BenchItem[]>([]);
   const [query, setQuery] = useState("");
   const [category, setCategory] = useState<(typeof CATEGORIES)[number]["id"]>("All");
   const [activeBenchId, setActiveBenchId] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  // Add Bench Modal 状态
+  const [isAddModalOpen, setIsAddModalOpen] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [addForm, setAddForm] = useState({
+    bench_name: "",
+    type: "language & reasoning",
+    description: "",
+    dataset_url: "",
+  });
+
+  // 从 API 获取 bench 数据
+  const fetchBenches = async () => {
+    setIsLoading(true);
+    setError(null);
+    try {
+      const apiBaseUrl = getApiBaseUrl();
+      const response = await fetch(`${apiBaseUrl}/api/benches/gallery`);
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      const data: BenchGalleryItem[] = await response.json();
+      const transformed = data.map(transformBenchGalleryItem);
+      setBenches(transformed);
+      saveGalleryBenches(transformed);
+    } catch (err) {
+      console.error("Failed to fetch benches:", err);
+      setError(err instanceof Error ? err.message : "Failed to fetch benches");
+      // 尝试从 localStorage 加载缓存数据
+      const cached = loadGalleryBenches();
+      if (cached.length > 0) {
+        setBenches(cached);
+      }
+    } finally {
+      setIsLoading(false);
+    }
+  };
 
   useEffect(() => {
-    setBenches(loadGalleryBenches());
+    // 先尝试从缓存加载，然后从 API 刷新
+    const cached = loadGalleryBenches();
+    if (cached.length > 0) {
+      setBenches(cached);
+      setIsLoading(false);
+    }
+    fetchBenches();
   }, []);
 
   const activeBench = useMemo(() => benches.find((b) => b.id === activeBenchId) ?? null, [benches, activeBenchId]);
@@ -158,7 +267,7 @@ export const Gallery = () => {
       .filter((b) => (category === "All" ? true : b.meta.category === category))
       .filter((b) => {
         if (!q) return true;
-        const hay = `${b.name} ${b.meta.description} ${b.meta.tags.join(" ")} ${b.meta.category}`.toLowerCase();
+        const hay = `${b.name} ${b.id} ${b.meta.description} ${b.meta.tags.join(" ")} ${b.meta.category}`.toLowerCase();
         return hay.includes(q);
       });
   }, [benches, query, category]);
@@ -175,9 +284,43 @@ export const Gallery = () => {
     });
   };
 
-  const handleReset = () => {
-    setBenches(DEFAULT_BENCHES);
-    saveGalleryBenches(DEFAULT_BENCHES);
+  const handleRefresh = () => {
+    fetchBenches();
+  };
+
+  const handleAddBench = async () => {
+    if (!addForm.bench_name.trim() || !addForm.description.trim()) {
+      return;
+    }
+
+    setIsSubmitting(true);
+    try {
+      const apiBaseUrl = getApiBaseUrl();
+      const response = await fetch(`${apiBaseUrl}/api/benches/gallery`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          bench_name: addForm.bench_name.trim(),
+          type: addForm.type,
+          description: addForm.description.trim(),
+          dataset_url: addForm.dataset_url.trim() || null,
+        }),
+      });
+
+      if (!response.ok) {
+        const err = await response.json();
+        throw new Error(err.detail || "Failed to add bench");
+      }
+
+      // 成功后刷新列表并关闭弹窗
+      await fetchBenches();
+      setIsAddModalOpen(false);
+      setAddForm({ bench_name: "", type: "language & reasoning", description: "", dataset_url: "" });
+    } catch (err) {
+      alert(err instanceof Error ? err.message : "Failed to add bench");
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   return (
@@ -188,11 +331,34 @@ export const Gallery = () => {
           <p className="text-slate-600 text-lg">Search, filter, and configure your curated benchmarks.</p>
         </div>
         <div className="flex gap-3">
-          <Button variant="outline" className="border-slate-200" onClick={handleReset}>
-            Reset to Defaults
+          <Button
+            className="bg-gradient-to-r from-blue-600 to-violet-600 text-white hover:from-blue-500 hover:to-violet-500"
+            onClick={() => setIsAddModalOpen(true)}
+          >
+            <Plus className="w-4 h-4 mr-2" />
+            Add Bench
+          </Button>
+          <Button
+            variant="outline"
+            className="border-slate-200"
+            onClick={handleRefresh}
+            disabled={isLoading}
+          >
+            {isLoading ? (
+              <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+            ) : (
+              <RefreshCw className="w-4 h-4 mr-2" />
+            )}
+            Refresh
           </Button>
         </div>
       </div>
+
+      {error && (
+        <div className="p-4 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
+          {error}. Showing cached data.
+        </div>
+      )}
 
       <div className="flex flex-col gap-4">
         <div className="flex flex-col md:flex-row gap-3 md:items-center md:justify-between">
@@ -224,65 +390,87 @@ export const Gallery = () => {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-        {filtered.map((bench, idx) => {
-          const { Icon, bg, fg } = getBenchIcon(bench.meta.category);
-          return (
-            <motion.div key={bench.id} initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: idx * 0.04 }}>
-              <Card className="h-full flex flex-col border-slate-200 hover:shadow-lg transition-shadow duration-300">
-                <CardHeader>
-                  <div className="flex justify-between items-start gap-4">
-                    <div className="flex items-center gap-3">
-                      <div className={cn("w-12 h-12 rounded-2xl flex items-center justify-center", bg)}>
-                        <Icon className={cn("w-6 h-6", fg)} />
+      {isLoading && benches.length === 0 ? (
+        <div className="flex flex-col items-center justify-center py-20 text-slate-500">
+          <Loader2 className="w-8 h-8 animate-spin mb-4" />
+          <p>Loading benchmarks...</p>
+        </div>
+      ) : benches.length === 0 ? (
+        <div className="flex flex-col items-center justify-center py-20 text-slate-500">
+          <p>No benchmarks available.</p>
+          <Button variant="outline" className="mt-4" onClick={handleRefresh}>
+            Try Again
+          </Button>
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+          {filtered.map((bench, idx) => {
+            const { Icon, bg, fg } = getBenchIcon(bench.meta.category);
+            return (
+              <motion.div key={bench.id} initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: idx * 0.04 }}>
+                <Card className="h-full flex flex-col border-slate-200 hover:shadow-lg transition-shadow duration-300">
+                  <CardHeader>
+                    <div className="flex justify-between items-start gap-4">
+                      <div className="flex items-center gap-3">
+                        <div className={cn("w-12 h-12 rounded-2xl flex items-center justify-center", bg)}>
+                          <Icon className={cn("w-6 h-6", fg)} />
+                        </div>
+                        <div>
+                          <CardTitle className="text-xl text-slate-900">{bench.name}</CardTitle>
+                          <div className="text-xs text-slate-500 mt-0.5">{bench.meta.category}</div>
+                        </div>
                       </div>
-                      <div>
-                        <CardTitle className="text-xl text-slate-900">{bench.name}</CardTitle>
-                        <div className="text-xs text-slate-500 mt-0.5">{bench.meta.category}</div>
-                      </div>
+                      {bench.meta.sampleCount != null && (
+                        <div className="px-2 py-1 bg-slate-50 border border-slate-200 rounded text-xs font-mono text-slate-500">
+                          {bench.meta.sampleCount.toLocaleString()} samples
+                        </div>
+                      )}
                     </div>
-                    {bench.meta.sampleCount != null && (
-                      <div className="px-2 py-1 bg-slate-50 border border-slate-200 rounded text-xs font-mono text-slate-500">
-                        {bench.meta.sampleCount.toLocaleString()} samples
-                      </div>
+
+                    <div className="flex flex-wrap gap-2 mt-4">
+                      {bench.meta.tags.slice(0, 4).map((tag) => (
+                        <span key={tag} className="text-xs px-2 py-0.5 rounded-full bg-slate-50 text-slate-600 border border-slate-200">
+                          {tag}
+                        </span>
+                      ))}
+                      {bench.meta.tags.length > 4 && (
+                        <span className="text-xs px-2 py-0.5 rounded-full bg-slate-50 text-slate-500 border border-slate-200">
+                          +{bench.meta.tags.length - 4}
+                        </span>
+                      )}
+                    </div>
+                  </CardHeader>
+
+                  <CardContent className="flex-1">
+                    <CardDescription className="text-sm text-slate-600 line-clamp-3">{bench.meta.description}</CardDescription>
+                  </CardContent>
+
+                  <CardFooter className="pt-4 border-t border-slate-100 bg-slate-50/30 flex gap-2">
+                    <Button
+                      className="flex-1 text-white bg-gradient-to-r from-blue-600 to-violet-600 hover:from-blue-500 hover:to-violet-500 shadow-sm shadow-blue-600/20"
+                      onClick={() => handleUseBench(bench.id)}
+                    >
+                      Use
+                    </Button>
+                    {bench.meta.datasetUrl && (
+                      <Button
+                        variant="outline"
+                        className="border-slate-200"
+                        onClick={() => window.open(bench.meta.datasetUrl, "_blank")}
+                      >
+                        <ExternalLink className="w-4 h-4" />
+                      </Button>
                     )}
-                  </div>
-
-                  <div className="flex flex-wrap gap-2 mt-4">
-                    {bench.meta.tags.slice(0, 4).map((tag) => (
-                      <span key={tag} className="text-xs px-2 py-0.5 rounded-full bg-slate-50 text-slate-600 border border-slate-200">
-                        {tag}
-                      </span>
-                    ))}
-                    {bench.meta.tags.length > 4 && (
-                      <span className="text-xs px-2 py-0.5 rounded-full bg-slate-50 text-slate-500 border border-slate-200">
-                        +{bench.meta.tags.length - 4}
-                      </span>
-                    )}
-                  </div>
-                </CardHeader>
-
-                <CardContent className="flex-1">
-                  <CardDescription className="text-sm text-slate-600 line-clamp-3">{bench.meta.description}</CardDescription>
-                </CardContent>
-
-                <CardFooter className="pt-4 border-t border-slate-100 bg-slate-50/30 flex gap-2">
-                  <Button
-                    className="flex-1 text-white bg-gradient-to-r from-blue-600 to-violet-600 hover:from-blue-500 hover:to-violet-500 shadow-sm shadow-blue-600/20"
-                    onClick={() => handleUseBench(bench.id)}
-                  >
-                    Use
-                  </Button>
-                  <Button variant="outline" className="border-slate-200" onClick={() => setActiveBenchId(bench.id)}>
-                    <SlidersHorizontal className="w-4 h-4 mr-2" />
-                    Configure
-                  </Button>
-                </CardFooter>
-              </Card>
-            </motion.div>
-          );
-        })}
-      </div>
+                    <Button variant="outline" className="border-slate-200" onClick={() => setActiveBenchId(bench.id)}>
+                      <SlidersHorizontal className="w-4 h-4" />
+                    </Button>
+                  </CardFooter>
+                </Card>
+              </motion.div>
+            );
+          })}
+        </div>
+      )}
 
       <AnimatePresence>
         {activeBench && (
@@ -393,6 +581,80 @@ export const Gallery = () => {
                     className="border-slate-200"
                   />
                 </div>
+
+                {activeBench.meta.datasetUrl && (
+                  <div className="space-y-2">
+                    <Label>Dataset URL</Label>
+                    <div className="flex gap-2">
+                      <Input
+                        value={activeBench.meta.datasetUrl}
+                        readOnly
+                        className="border-slate-200 bg-slate-50 text-slate-600 flex-1"
+                      />
+                      <Button
+                        variant="outline"
+                        className="border-slate-200 shrink-0"
+                        onClick={() => window.open(activeBench.meta.datasetUrl, "_blank")}
+                      >
+                        <ExternalLink className="w-4 h-4" />
+                      </Button>
+                    </div>
+                  </div>
+                )}
+
+                {activeBench.meta.datasetKeys && activeBench.meta.datasetKeys.length > 0 && (
+                  <div className="space-y-2">
+                    <Label>Dataset Keys</Label>
+                    <div className="flex flex-wrap gap-1.5 p-3 rounded-md border border-slate-200 bg-slate-50">
+                      {activeBench.meta.datasetKeys.map((key) => (
+                        <span key={key} className="text-xs px-2 py-1 rounded bg-white border border-slate-200 text-slate-600 font-mono">
+                          {key}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* 显示额外的 bench_gallery.json 信息 */}
+                {activeBench._raw && (
+                  <>
+                    {activeBench._raw.meta?.download_config && (
+                      <div className="space-y-2">
+                        <Label>Download Config</Label>
+                        <div className="p-3 rounded-md border border-slate-200 bg-slate-50 text-xs font-mono space-y-1">
+                          <div><span className="text-slate-500">config:</span> {activeBench._raw.meta.download_config.config}</div>
+                          <div><span className="text-slate-500">split:</span> {activeBench._raw.meta.download_config.split}</div>
+                        </div>
+                      </div>
+                    )}
+
+                    {activeBench._raw.meta?.key_mapping && (
+                      <div className="space-y-2">
+                        <Label>Key Mapping</Label>
+                        <div className="p-3 rounded-md border border-slate-200 bg-slate-50 text-xs font-mono space-y-1">
+                          {activeBench._raw.meta.key_mapping.input_question_key && (
+                            <div><span className="text-slate-500">question:</span> {activeBench._raw.meta.key_mapping.input_question_key}</div>
+                          )}
+                          {activeBench._raw.meta.key_mapping.input_target_key && (
+                            <div><span className="text-slate-500">target:</span> {activeBench._raw.meta.key_mapping.input_target_key}</div>
+                          )}
+                          {activeBench._raw.meta.key_mapping.input_context_key && (
+                            <div><span className="text-slate-500">context:</span> {activeBench._raw.meta.key_mapping.input_context_key}</div>
+                          )}
+                        </div>
+                      </div>
+                    )}
+
+                    {activeBench._raw.bench_dataflow_eval_type && (
+                      <div className="space-y-2">
+                        <Label>Eval Type</Label>
+                        <div className="px-3 py-2 rounded-md border border-slate-200 bg-slate-50 text-sm text-slate-600">
+                          {activeBench._raw.bench_dataflow_eval_type}
+                        </div>
+                      </div>
+                    )}
+                  </>
+                )}
               </div>
 
               <div className="mt-8 flex gap-2">
@@ -401,6 +663,106 @@ export const Gallery = () => {
                 </Button>
                 <Button variant="outline" className="border-slate-200" onClick={() => setActiveBenchId(null)}>
                   Close
+                </Button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Add Bench Modal */}
+      <AnimatePresence>
+        {isAddModalOpen && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center"
+          >
+            <div className="absolute inset-0 bg-black/20" onClick={() => setIsAddModalOpen(false)} />
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              className="relative bg-white rounded-2xl shadow-2xl p-6 w-full max-w-lg mx-4"
+            >
+              <div className="flex items-center justify-between mb-6">
+                <h2 className="text-xl font-bold text-slate-900">Add New Benchmark</h2>
+                <button
+                  className="p-2 rounded-lg hover:bg-slate-100 text-slate-500"
+                  onClick={() => setIsAddModalOpen(false)}
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="space-y-4">
+                <div className="space-y-2">
+                  <Label>Benchmark Name *</Label>
+                  <Input
+                    value={addForm.bench_name}
+                    onChange={(e) => setAddForm({ ...addForm, bench_name: e.target.value })}
+                    placeholder="e.g., org/dataset_name"
+                    className="border-slate-200"
+                  />
+                  <p className="text-xs text-slate-500">Use HuggingFace format: org/dataset_name</p>
+                </div>
+
+                <div className="space-y-2">
+                  <Label>Type *</Label>
+                  <select
+                    value={addForm.type}
+                    onChange={(e) => setAddForm({ ...addForm, type: e.target.value })}
+                    className="w-full h-10 rounded-md border border-slate-200 bg-white px-3 text-sm text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-300"
+                  >
+                    {BENCH_TYPES.map((t) => (
+                      <option key={t} value={t}>{t}</option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="space-y-2">
+                  <Label>Description *</Label>
+                  <textarea
+                    value={addForm.description}
+                    onChange={(e) => setAddForm({ ...addForm, description: e.target.value })}
+                    placeholder="Describe what this benchmark evaluates..."
+                    className="w-full min-h-[100px] rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-300"
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <Label>Dataset URL (optional)</Label>
+                  <Input
+                    value={addForm.dataset_url}
+                    onChange={(e) => setAddForm({ ...addForm, dataset_url: e.target.value })}
+                    placeholder="https://huggingface.co/datasets/..."
+                    className="border-slate-200"
+                  />
+                  <p className="text-xs text-slate-500">Leave empty to auto-generate from bench name</p>
+                </div>
+              </div>
+
+              <div className="mt-6 flex gap-3">
+                <Button
+                  className="flex-1 bg-gradient-to-r from-blue-600 to-violet-600 text-white hover:from-blue-500 hover:to-violet-500"
+                  onClick={handleAddBench}
+                  disabled={isSubmitting || !addForm.bench_name.trim() || !addForm.description.trim()}
+                >
+                  {isSubmitting ? (
+                    <>
+                      <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                      Adding...
+                    </>
+                  ) : (
+                    <>
+                      <Plus className="w-4 h-4 mr-2" />
+                      Add Benchmark
+                    </>
+                  )}
+                </Button>
+                <Button variant="outline" className="border-slate-200" onClick={() => setIsAddModalOpen(false)}>
+                  Cancel
                 </Button>
               </div>
             </motion.div>
