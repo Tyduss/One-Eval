@@ -47,7 +47,7 @@ We provide two environment management methods: Conda and uv. Choose one to get s
 
 #### Option A: Conda
 ```bash
-conda create -n one-eval python=3.10 -y
+conda create -n one-eval python=3.11 -y
 conda activate one-eval
 pip install -e .
 ```
