@@ -12,6 +12,14 @@ from langgraph.types import Command
 from one_eval.runtime.progress_store import set_progress, clear_progress
 
 log = get_logger("DataFlowEvalNode")
+VALID_EVAL_TYPES = {
+    "key1_text_score",
+    "key2_qa",
+    "key2_q_ma",
+    "key3_q_choices_a",
+    "key3_q_choices_as",
+    "key3_q_a_rejected",
+}
 
 
 class DataFlowEvalNode(BaseNode):
@@ -106,6 +114,21 @@ class DataFlowEvalNode(BaseNode):
                     "waiting_for_human": True,
                     "error_flag": True,
                     "error_msg": f"[{bench.bench_name}] 缺少eval_type，请修正Key Mapping/任务类型后重试评测。",
+                },
+            )
+        if str(bench.bench_dataflow_eval_type).strip() not in VALID_EVAL_TYPES:
+            self.logger.warning(f"[{bench.bench_name}] 非法 eval_type={bench.bench_dataflow_eval_type}")
+            bench.eval_status = "failed"
+            approved = list(getattr(state, "approved_warning_ids", []) or [])
+            confirm_id = "PreEvalReviewNode_confirm"
+            approved = [x for x in approved if x != confirm_id]
+            return Command(
+                goto="PreEvalReviewNode",
+                update={
+                    "approved_warning_ids": approved,
+                    "waiting_for_human": True,
+                    "error_flag": True,
+                    "error_msg": f"[{bench.bench_name}] eval_type 无效（{bench.bench_dataflow_eval_type}），请在基准配置中重新选择后再评测。",
                 },
             )
 

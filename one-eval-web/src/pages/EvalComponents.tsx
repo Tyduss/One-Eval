@@ -206,6 +206,7 @@ export const BenchCard = ({ bench, activeNode, lang, onUpdate, onRetryDownload }
 
     // Init state from bench
     useEffect(() => {
+        if (!isDetailsOpen) return;
         if (keyMapping) {
             setEditKeyMap({ ...keyMapping });
         }
@@ -222,7 +223,7 @@ export const BenchCard = ({ bench, activeNode, lang, onUpdate, onRetryDownload }
             }
         }
         setSelectedPreviewRow(0);
-    }, [bench, isDetailsOpen]);
+    }, [isDetailsOpen, bench.bench_name]);
 
     const handleSave = () => {
         if (!onUpdate) return;
@@ -709,6 +710,7 @@ interface ChatPanelProps {
     status: string;
     onSendMessage: (msg: string) => void;
     onConfirm: () => void;
+    onStop?: () => void;
     isWaitingForInput: boolean;
     activeNodeId?: string | null;
     isCollapsed: boolean;
@@ -719,7 +721,7 @@ interface ChatPanelProps {
 
 const EMOJIS = ["✨", "🤖", "🚀", "💡", "🔮", "✅", "🎯"];
 
-export const ChatPanel = ({ messages, status, onSendMessage, onConfirm, isWaitingForInput, activeNodeId, isCollapsed, onToggleCollapse, lang, interruptToken }: ChatPanelProps) => {
+export const ChatPanel = ({ messages, status, onSendMessage, onConfirm, onStop, isWaitingForInput, activeNodeId, isCollapsed, onToggleCollapse, lang, interruptToken }: ChatPanelProps) => {
     const [input, setInput] = React.useState("");
     const [dismissedInterrupts, setDismissedInterrupts] = React.useState<string[]>([]);
     const tt = (zh: string, en: string) => (lang === "zh" ? zh : en);
@@ -847,6 +849,9 @@ export const ChatPanel = ({ messages, status, onSendMessage, onConfirm, isWaitin
                                     <div className="flex gap-3">
                                         <Button size="sm" onClick={handleConfirm} className="flex-1 bg-amber-500 hover:bg-amber-600 text-white shadow-lg shadow-amber-500/20 border-0 rounded-xl h-9">
                                             <Check className="w-4 h-4 mr-1.5" /> {tt("批准", "Approve")}
+                                        </Button>
+                                        <Button size="sm" variant="outline" onClick={onStop} className="h-9 rounded-xl">
+                                            {tt("停止", "Stop")}
                                         </Button>
                                     </div>
                                 </div>

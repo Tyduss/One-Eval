@@ -341,7 +341,10 @@ export const Eval = () => {
     if (status === "interrupted" && currentNode?.includes("PreEvalReviewNode")) {
         const benchesToCheck = (editBenches.length ? editBenches : (state?.benches || [])) as any[];
         const missingEvalType = benchesToCheck
-            .filter((b: any) => !(b?.bench_dataflow_eval_type || b?.eval_type || b?.meta?.bench_dataflow_eval_type))
+            .filter((b: any) => {
+                const v = String(b?.bench_dataflow_eval_type || b?.eval_type || b?.meta?.bench_dataflow_eval_type || "").trim();
+                return !v || v === "unknown";
+            })
             .map((b: any) => b?.bench_name || "unknown");
         if (missingEvalType.length > 0) {
             setMessages(prev => [...prev, {
@@ -393,11 +396,19 @@ export const Eval = () => {
                     seed: evalParams.seed
                 }
               : null;
+          const shouldSendBenches = Boolean(
+              status === "interrupted"
+              && !currentNode?.includes("MetricReviewNode")
+              && Array.isArray(editBenches)
+              && editBenches.length > 0
+          );
           payload.state_updates = {
-              benches: editBenches,
               target_model_name: selectedModel?.name ?? state?.target_model_name,
               request: { language: lang }
           };
+          if (shouldSendBenches) {
+              payload.state_updates.benches = editBenches.length ? editBenches : (state?.benches || []);
+          }
           if (modelForUpdate) {
               payload.state_updates.target_model = modelForUpdate;
           }
@@ -509,14 +520,20 @@ export const Eval = () => {
           ? bench.task_type.map((t: any) => typeof t === 'object' ? JSON.stringify(t) : String(t))
           : [];
 
+      const inferredEvalTypeRaw =
+          bench?.bench_dataflow_eval_type || bench?.eval_type || bench?.meta?.bench_dataflow_eval_type || "";
+      const inferredEvalType = inferredEvalTypeRaw === "unknown" ? "" : String(inferredEvalTypeRaw || "");
+
       const newBench: Bench = {
           bench_name: bench.bench_name,
-          eval_type: safeTaskTypes.length > 0 ? safeTaskTypes[0] : "unknown",
+          eval_type: inferredEvalType,
+          bench_dataflow_eval_type: inferredEvalType,
           meta: {
               ...bench.meta,
               tags: safeTaskTypes, // Store all task types as tags
               source: "gallery", // Flag to skip probing
               skip_probing: true,
+              bench_dataflow_eval_type: inferredEvalType,
               keys: [], // Default empty keys to prevent white screen
               preview_data: [] // Default empty preview to prevent white screen
           }
@@ -644,32 +661,36 @@ export const Eval = () => {
       setMessages(prev => [...prev, { id: Date.now().toString(), role: "ai", content: t({ zh: "已启动手动评测，正在运行 DataFlowEval...", en: "Manual evaluation started. Running DataFlowEval..." }), timestamp: Date.now() }]);
   };
 
+  const handleStopWorkflow = async () => {
+      if (!threadId) return;
+      try {
+          await axios.post(`${apiBaseUrl}/api/workflow/stop/${threadId}`);
+          setStatus("stopped");
+          setMessages(prev => [
+              ...prev,
+              {
+                  id: Date.now().toString(),
+                  role: "system",
+                  content: t({ zh: "已发送停止请求。", en: "Stop request has been sent." }),
+                  timestamp: Date.now(),
+              },
+          ]);
+      } catch (e) {
+          setMessages(prev => [
+              ...prev,
+              {
+                  id: Date.now().toString(),
+                  role: "system",
+                  content: t({ zh: "停止失败，请重试。", en: "Failed to stop. Please retry." }),
+                  timestamp: Date.now(),
+              },
+          ]);
+      }
+  };
+
   const handleRunClick = async () => {
       if (status === "running") {
-          if (!threadId) return;
-          try {
-              await axios.post(`${apiBaseUrl}/api/workflow/stop/${threadId}`);
-              setStatus("stopped");
-              setMessages(prev => [
-                  ...prev,
-                  {
-                      id: Date.now().toString(),
-                      role: "system",
-                      content: t({ zh: "已发送停止请求。", en: "Stop request has been sent." }),
-                      timestamp: Date.now(),
-                  },
-              ]);
-          } catch (e) {
-              setMessages(prev => [
-                  ...prev,
-                  {
-                      id: Date.now().toString(),
-                      role: "system",
-                      content: t({ zh: "停止失败，请重试。", en: "Failed to stop. Please retry." }),
-                      timestamp: Date.now(),
-                  },
-              ]);
-          }
+          await handleStopWorkflow();
           return;
       }
       if (workMode === "manual") {
@@ -2051,6 +2072,7 @@ export const Eval = () => {
                 status={status}
                 onSendMessage={handleStart}
                 onConfirm={handleResume}
+                onStop={handleStopWorkflow}
                 isWaitingForInput={status !== "idle"}
                 activeNodeId={activeNode} 
                 isCollapsed={isChatCollapsed}

@@ -190,12 +190,16 @@ class ScoreCalcAgent(CustomAgent):
             
             # Extract simple metrics for meta display
             simple_metrics = {mname: mres.get("score") for mname, mres in metrics.items() if isinstance(mres, dict) and "score" in mres}
-            
-            # Update bench.meta["eval_result"] so frontend can display them
+
+            # Update bench.meta["eval_result"] while protecting DataFlow base score fields
             if "eval_result" not in bench.meta or not isinstance(bench.meta["eval_result"], dict):
                 bench.meta["eval_result"] = {}
-            
-            bench.meta["eval_result"].update(simple_metrics)
+            protected_keys = {"score", "accuracy", "exact_match", "valid_samples", "total_samples"}
+            for mname, mscore in simple_metrics.items():
+                if mname in protected_keys:
+                    bench.meta["eval_result"][f"metric_{mname}"] = mscore
+                else:
+                    bench.meta["eval_result"][mname] = mscore
 
             # Update bench.meta["metric_summary"] so frontend can display them
             metric_summary_text = metrics.get("metric_summary_analyst", {}).get("summary")
