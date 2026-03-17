@@ -16,7 +16,7 @@
     <i>✨ One Eval, Evaluation in One ✨</i>
   </h4>
   <br>
-  
+
 One-Eval is an automated Agent-based evaluation framework for Large Language Models, designed to achieve **NL2Eval**: automatically orchestrating evaluation workflows and generating reports from natural language requirements.\
 Built on [DataFlow](https://github.com/OpenDCAI/DataFlow) and [LangGraph](https://github.com/langchain-ai/langgraph), it emphasizes a traceable, interruptible, and scalable evaluation loop.
 
@@ -116,7 +116,7 @@ One-Eval has a built-in rich **Bench Gallery** for unified management of meta-in
 
 !\[Bench Gallery]\(./static/logo/gallery.png null)
 
-## � 5. Future Work
+## 🚀 5. Future Work
 
 We plan to continuously maintain and update One-Eval in the following directions:
 
@@ -126,7 +126,7 @@ We plan to continuously maintain and update One-Eval in the following directions
 
 🙌 **Join Us**: We warmly welcome co-workers to join our open-source project! Feel free to contact us directly for co-development. We highly support contributors in exploring different directions and achieving their own outputs (e.g., collaborating on paper submissions).
 
-## �📮 6. Contact & Citation
+## 📮 6. Contact & Citation
 
 If you are interested in this project, or have any questions or suggestions, please contact us via Issue or join our WeChat group.
 
