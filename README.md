@@ -135,10 +135,8 @@ If you are interested in this project, or have any questions or suggestions, ple
 •	🔧 [GitHub Pull Requests](../../pulls): Contribute code improvements.
 
 <div align="center">
-  <img src="./static/logo/318QRcode.jpg" width="30%">
+  <img src="https://github.com/user-attachments/assets/306ab88b-024f-4a44-877f-f4c39f77ab32" width="30%">
 </div>
-
-If you use One-Eval in your research, please cite our work:
 
 ## Citation
 
