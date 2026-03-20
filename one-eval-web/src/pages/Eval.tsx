@@ -96,6 +96,7 @@ export const Eval = () => {
   const [expandedMetricSummaries, setExpandedMetricSummaries] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState<any | null>(null);
   const [selectedModels, setSelectedModels] = useState<any[]>([]);
+  const [primaryModelIndex, setPrimaryModelIndex] = useState<number>(0); // 主模型索引
   const [manualModelPath, setManualModelPath] = useState<string>("");
   const [manualBenches, setManualBenches] = useState<Bench[]>([]);
   const [editMetricPlan, setEditMetricPlan] = useState<Record<string, any[]> | null>(null);
@@ -196,7 +197,13 @@ export const Eval = () => {
                               .filter(i => i >= 0 && i < res.data.length)
                               .map(i => res.data[i]);
                           setSelectedModels(selected);
-                          if (selected.length > 0) {
+                          // 恢复主模型索引
+                          const savedPrimaryIdx = localStorage.getItem("oneEval.primaryModelIndex");
+                          const primaryIdx = savedPrimaryIdx ? parseInt(savedPrimaryIdx, 10) : 0;
+                          if (selected.length > 0 && primaryIdx >= 0 && primaryIdx < selected.length) {
+                              setPrimaryModelIndex(primaryIdx);
+                              setSelectedModel(selected[primaryIdx]);
+                          } else if (selected.length > 0) {
                               setSelectedModel(selected[0]);
                           }
                       }
@@ -1703,10 +1710,22 @@ export const Eval = () => {
                                        {selectedModels.length > 0 ? (
                                            <div className="flex flex-wrap gap-2 p-3 rounded-lg border border-emerald-200 bg-emerald-50/30">
                                                {selectedModels.map((m: any, idx: number) => (
-                                                   <div key={m.name} className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-white border border-emerald-200 text-xs font-medium text-slate-700">
+                                                   <div
+                                                     key={m.name}
+                                                     onClick={() => {
+                                                       setPrimaryModelIndex(idx);
+                                                       setSelectedModel(m);
+                                                       localStorage.setItem("oneEval.primaryModelIndex", String(idx));
+                                                     }}
+                                                     className={`flex items-center gap-1.5 px-2 py-1 rounded-md text-xs font-medium cursor-pointer transition-all ${
+                                                       idx === primaryModelIndex
+                                                         ? "bg-emerald-100 border-2 border-emerald-400 text-emerald-800"
+                                                         : "bg-white border border-slate-200 text-slate-700 hover:border-emerald-300"
+                                                     }`}
+                                                   >
                                                        {m.is_api && <span className="text-violet-500">API</span>}
                                                        <span>{m.name}</span>
-                                                       {idx === 0 && <span className="text-emerald-500 text-[10px]">(主)</span>}
+                                                       {idx === primaryModelIndex && <span className="text-emerald-600 text-[10px]">(主)</span>}
                                                    </div>
                                                ))}
                                                <button
