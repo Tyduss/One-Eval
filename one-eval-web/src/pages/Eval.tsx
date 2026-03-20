@@ -95,6 +95,7 @@ export const Eval = () => {
   const [expandedMetricResults, setExpandedMetricResults] = useState<string[]>([]);
   const [expandedMetricSummaries, setExpandedMetricSummaries] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState<any | null>(null);
+  const [selectedModels, setSelectedModels] = useState<any[]>([]);
   const [manualModelPath, setManualModelPath] = useState<string>("");
   const [manualBenches, setManualBenches] = useState<Bench[]>([]);
   const [editMetricPlan, setEditMetricPlan] = useState<Record<string, any[]> | null>(null);
@@ -186,6 +187,20 @@ export const Eval = () => {
           .then(res => {
               if (Array.isArray(res.data)) {
                   setAvailableModels(res.data);
+                  // 从 localStorage 恢复选中的模型
+                  try {
+                      const saved = localStorage.getItem("oneEval.selectedModels");
+                      if (saved) {
+                          const idxs: number[] = JSON.parse(saved);
+                          const selected = idxs
+                              .filter(i => i >= 0 && i < res.data.length)
+                              .map(i => res.data[i]);
+                          setSelectedModels(selected);
+                          if (selected.length > 0) {
+                              setSelectedModel(selected[0]);
+                          }
+                      }
+                  } catch (e) {}
               }
           })
           .catch(e => console.error("Failed to fetch models", e));
@@ -1677,27 +1692,61 @@ export const Eval = () => {
                                })()}
                                <div className="grid grid-cols-12 gap-x-4 gap-y-4">
                                    <div className="col-span-12 min-w-0">
-                                       <label className="text-[10px] uppercase font-bold text-slate-400 mb-1.5 block px-1">{t({ zh: "目标模型", en: "Target Model" })}</label>
-                                       {availableModels && availableModels.length > 0 ? (
-                                           <select
-                                               value={(selectedModel?.name ?? state?.target_model_name ?? "") as any}
-                                               onChange={(e) => {
-                                                   const found = availableModels.find((m: any) => m?.name === e.target.value);
-                                                  if (found) {
-                                                      setSelectedModel(found);
-                                                      if (found?.path) setManualModelPath(found.path);
-                                                  }
-                                               }}
-                                               disabled={status === "running"}
-                                               className="w-full h-9 rounded-lg border border-emerald-200 bg-white px-3 text-sm font-bold text-slate-900 shadow-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all disabled:opacity-50 disabled:bg-slate-50/50"
-                                           >
-                                               {availableModels.map((m: any) => (
-                                                   <option key={m.name} value={m.name}>{m.name}</option>
+                                       <div className="flex items-center justify-between mb-1.5 px-1">
+                                           <label className="text-[10px] uppercase font-bold text-slate-400">{t({ zh: "目标模型", en: "Target Models" })}</label>
+                                           {selectedModels.length > 0 && (
+                                               <span className="text-[10px] font-medium text-emerald-600">
+                                                   {t({ zh: `已选择 ${selectedModels.length} 个模型`, en: `${selectedModels.length} models selected` })}
+                                               </span>
+                                           )}
+                                       </div>
+                                       {selectedModels.length > 0 ? (
+                                           <div className="flex flex-wrap gap-2 p-3 rounded-lg border border-emerald-200 bg-emerald-50/30">
+                                               {selectedModels.map((m: any, idx: number) => (
+                                                   <div key={m.name} className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-white border border-emerald-200 text-xs font-medium text-slate-700">
+                                                       {m.is_api && <span className="text-violet-500">API</span>}
+                                                       <span>{m.name}</span>
+                                                       {idx === 0 && <span className="text-emerald-500 text-[10px]">(主)</span>}
+                                                   </div>
                                                ))}
-                                           </select>
+                                               <button
+                                                   type="button"
+                                                   onClick={() => {
+                                                       setSelectedModels([]);
+                                                       setSelectedModel(null);
+                                                       localStorage.removeItem("oneEval.selectedModels");
+                                                   }}
+                                                   className="px-2 py-1 rounded-md text-xs text-red-500 hover:bg-red-50 transition-colors"
+                                                   disabled={status === "running"}
+                                               >
+                                                   {t({ zh: "清除选择", en: "Clear" })}
+                                               </button>
+                                           </div>
+                                       ) : availableModels && availableModels.length > 0 ? (
+                                           <div className="p-3 rounded-lg border border-amber-200 bg-amber-50/30 text-xs">
+                                               <p className="text-amber-700 mb-2">{t({ zh: "请先在「设置」页面勾选要评测的模型", en: "Please select models in Settings page first" })}</p>
+                                               <select
+                                                   title={t({ zh: "选择单个模型（备用）", en: "Select a single model (fallback)" })}
+                                                   value={(selectedModel?.name ?? state?.target_model_name ?? "") as any}
+                                                   onChange={(e) => {
+                                                       const found = availableModels.find((m: any) => m?.name === e.target.value);
+                                                       if (found) {
+                                                           setSelectedModel(found);
+                                                           if (found?.path) setManualModelPath(found.path);
+                                                       }
+                                                   }}
+                                                   disabled={status === "running"}
+                                                   className="w-full h-9 rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-900"
+                                               >
+                                                   <option value="">{t({ zh: "或选择单个模型...", en: "Or select a single model..." })}</option>
+                                                   {availableModels.map((m: any) => (
+                                                       <option key={m.name} value={m.name}>{m.name}{m.is_api ? " (API)" : ""}</option>
+                                                   ))}
+                                               </select>
+                                           </div>
                                        ) : (
-                                           <div className="h-9 flex items-center px-3 rounded-lg border border-emerald-200 bg-slate-50/50 text-sm font-bold text-slate-500 italic">
-                                               {state?.target_model_name || t({ zh: "未选择模型", en: "No model selected" })}
+                                           <div className="h-9 flex items-center px-3 rounded-lg border border-slate-200 bg-slate-50/50 text-sm text-slate-500 italic">
+                                               {t({ zh: "未注册模型，请先到设置页添加", en: "No models registered. Please add in Settings" })}
                                            </div>
                                        )}
                                    </div>
