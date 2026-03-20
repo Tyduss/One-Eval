@@ -357,11 +357,16 @@ export const Settings = () => {
   const handleUpdateModel = async (index: number) => {
     if (!editModel.name || !editModel.path) return;
     try {
+      // 如果 api_key 为空，保留原来的 key
+      const modelToUpdate = { ...editModel };
+      if (!modelToUpdate.api_key && models[index]?.api_key) {
+        modelToUpdate.api_key = models[index].api_key;
+      }
       // 更新后端
-      await axios.put(`${apiBaseUrl}/api/models/${index}`, editModel);
+      await axios.put(`${apiBaseUrl}/api/models/${index}`, modelToUpdate);
       // 更新本地状态
       const newModels = [...models];
-      newModels[index] = editModel;
+      newModels[index] = modelToUpdate;
       setModels(newModels);
       setEditingIndex(null);
       setEditModel({ name: "", path: "", is_api: false, api_url: "", api_key: "" });
@@ -735,9 +740,15 @@ export const Settings = () => {
                               />
                             </div>
                             <div className="space-y-2">
-                              <Label>{tt("API Key（可选）", "API Key (Optional)")}</Label>
+                              <div className="flex items-center justify-between">
+                                <Label>{tt("API Key", "API Key")}</Label>
+                                {models[i]?.api_key && !editModel.api_key && (
+                                  <span className="text-[10px] text-amber-600">{tt("原密钥已保留，留空则保持不变", "Original key preserved, leave empty to keep")}</span>
+                                )}
+                              </div>
                               <Input
-                                type="password"
+                                type="text"
+                                placeholder={models[i]?.api_key ? tt("留空保持原密钥", "Leave empty to keep original") : tt("sk-... (可选)", "sk-... (optional)")}
                                 value={editModel.api_key || ""}
                                 onChange={e => setEditModel({...editModel, api_key: e.target.value})}
                                 className="bg-white"
@@ -799,7 +810,8 @@ export const Settings = () => {
                             className="text-slate-500 hover:text-slate-700 hover:bg-slate-100"
                             onClick={() => {
                               setEditingIndex(i);
-                              setEditModel({ ...m });
+                              // 编辑时不带 api_key，防止泄露
+                              setEditModel({ ...m, api_key: "" });
                             }}
                           >
                             <Pencil className="w-4 h-4" />
