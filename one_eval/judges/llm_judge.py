@@ -99,6 +99,7 @@ class LLMJudge:
                 api_key=jc.api_key or "",
                 api_provider=getattr(jc, "api_provider", "openai_compatible"),
                 temperature=0.0,
+                request_timeout=getattr(jc, "api_timeout", None),
             )
         return self._caller
 

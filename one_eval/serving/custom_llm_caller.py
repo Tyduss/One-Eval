@@ -51,7 +51,8 @@ class CustomLLMCaller(BaseLLMCaller):
         base_url: str,
         api_key: str,
         api_provider: str = "openai_compatible",
-        temperature: float = 0.0
+        temperature: float = 0.0,
+        request_timeout: Optional[float] = None,
     ):
         super().__init__(
             state=state,
@@ -64,9 +65,13 @@ class CustomLLMCaller(BaseLLMCaller):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.api_provider = api_provider  # "openai_compatible" | "anthropic"
-        timeout_s = int(os.getenv("OE_TIMEOUT_S") or os.getenv("DF_TIMEOUT_S") or 60)
+        # 优先级：显式参数 > 环境变量 > 默认 30
+        if request_timeout is not None and request_timeout > 0:
+            timeout_s = float(request_timeout)
+        else:
+            timeout_s = float(os.getenv("OE_TIMEOUT_S") or os.getenv("DF_TIMEOUT_S") or 30)
         if timeout_s <= 0:
-            timeout_s = 60
+            timeout_s = 30
         if not self.model_name:
             self.model_name = os.getenv("DF_MODEL_NAME") or os.getenv("OE_MODEL_NAME") or "gpt-4o"
 

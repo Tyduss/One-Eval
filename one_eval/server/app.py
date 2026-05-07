@@ -619,6 +619,10 @@ class StartWorkflowRequest(BaseModel):
     api_url: Optional[str] = None
     api_key: Optional[str] = None
     api_provider: str = "openai_compatible"
+    # API resilience
+    api_concurrency: int = 1
+    api_timeout: float = 30.0
+    api_max_retries: int = 3
     # Multi-model support
     target_models: Optional[List[Dict[str, Any]]] = None
 
@@ -696,6 +700,9 @@ async def start_workflow(req: StartWorkflowRequest):
                 repetition_penalty=m.get("repetition_penalty", req.repetition_penalty),
                 max_model_len=m.get("max_model_len", req.max_model_len),
                 gpu_memory_utilization=m.get("gpu_memory_utilization", req.gpu_memory_utilization),
+                api_concurrency=int(m.get("api_concurrency", req.api_concurrency) or req.api_concurrency),
+                api_timeout=float(m.get("api_timeout", req.api_timeout) or req.api_timeout),
+                api_max_retries=int(m.get("api_max_retries", req.api_max_retries) or req.api_max_retries),
             )
             target_models_list.append(cfg)
         log.info(f"Multi-model mode: {len(target_models_list)} models")
@@ -716,6 +723,9 @@ async def start_workflow(req: StartWorkflowRequest):
             repetition_penalty=req.repetition_penalty,
             max_model_len=req.max_model_len,
             gpu_memory_utilization=req.gpu_memory_utilization,
+            api_concurrency=req.api_concurrency,
+            api_timeout=req.api_timeout,
+            api_max_retries=req.api_max_retries,
         )
         target_models_list.append(single_model)
         log.info(f"Single-model mode (fallback)")
@@ -936,6 +946,9 @@ async def resume_workflow(thread_id: str, req: ResumeWorkflowRequest):
                     tensor_parallel_size=int(tm.get("tensor_parallel_size", 1) or 1),
                     max_model_len=tm.get("max_model_len"),
                     gpu_memory_utilization=float(tm.get("gpu_memory_utilization", 0.9) or 0.9),
+                    api_concurrency=int(tm.get("api_concurrency", 1) or 1),
+                    api_timeout=float(tm.get("api_timeout", 30.0) or 30.0),
+                    api_max_retries=int(tm.get("api_max_retries", 3) or 3),
                 )
             except Exception as e:
                 log.error(f"Failed to parse target_model update: {e}")
@@ -1154,7 +1167,9 @@ async def manual_start(req: ManualStartRequest):
                 tensor_parallel_size=int(tm.get("tensor_parallel_size", 1) or 1),
                 max_model_len=tm.get("max_model_len"),
                 gpu_memory_utilization=float(tm.get("gpu_memory_utilization", 0.9) or 0.9),
-                api_concurrency=int(tm.get("api_concurrency", 16) or 16),
+                api_concurrency=int(tm.get("api_concurrency", 1) or 1),
+                api_timeout=float(tm.get("api_timeout", 30.0) or 30.0),
+                api_max_retries=int(tm.get("api_max_retries", 3) or 3),
             )
             target_models_list.append(cfg)
 
@@ -1183,7 +1198,9 @@ async def manual_start(req: ManualStartRequest):
                 tensor_parallel_size=int(tm.get("tensor_parallel_size", 1) or 1),
                 max_model_len=tm.get("max_model_len"),
                 gpu_memory_utilization=float(tm.get("gpu_memory_utilization", 0.9) or 0.9),
-                api_concurrency=int(tm.get("api_concurrency", 16) or 16),
+                api_concurrency=int(tm.get("api_concurrency", 1) or 1),
+                api_timeout=float(tm.get("api_timeout", 30.0) or 30.0),
+                api_max_retries=int(tm.get("api_max_retries", 3) or 3),
             )
             target_models_list.append(single_model)
 
@@ -2602,6 +2619,8 @@ async def start_judge(req: JudgeStartRequest):
         api_provider=req.judge_model.get("api_provider", "openai_compatible"),
         temperature=0.0,
         max_tokens=4096,
+        api_timeout=float(req.judge_model.get("api_timeout", 30.0) or 30.0),
+        api_max_retries=int(req.judge_model.get("api_max_retries", 3) or 3),
     )
 
     # 计算预估样本总数

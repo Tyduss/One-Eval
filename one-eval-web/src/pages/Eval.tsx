@@ -105,7 +105,9 @@ export const Eval = () => {
       top_k: -1,
       repetition_penalty: 1.0,
       max_tokens: 2048,
-      api_concurrency: 16,
+      api_concurrency: 1,
+      api_timeout: 30,
+      api_max_retries: 3,
       tensor_parallel_size: 1,
       max_model_len: 32768,
       gpu_memory_utilization: 0.9,
@@ -613,6 +615,9 @@ export const Eval = () => {
               top_k: state.target_model.top_k ?? -1,
               repetition_penalty: state.target_model.repetition_penalty ?? 1.0,
               max_tokens: state.target_model.max_tokens ?? 2048,
+              api_concurrency: state.target_model.api_concurrency ?? 1,
+              api_timeout: state.target_model.api_timeout ?? 30,
+              api_max_retries: state.target_model.api_max_retries ?? 3,
               tensor_parallel_size: state.target_model.tensor_parallel_size ?? 1,
               max_model_len: state.target_model.max_model_len ?? 32768,
               gpu_memory_utilization: state.target_model.gpu_memory_utilization ?? 0.9,
@@ -788,6 +793,8 @@ export const Eval = () => {
                     gpu_memory_utilization: evalParams.gpu_memory_utilization,
                     seed: evalParams.seed,
                     api_concurrency: evalParams.api_concurrency,
+                    api_timeout: evalParams.api_timeout,
+                    api_max_retries: evalParams.api_max_retries,
                 }
               : null;
           const shouldSendBenches = Boolean(
@@ -1072,6 +1079,8 @@ export const Eval = () => {
                 gpu_memory_utilization: evalParams.gpu_memory_utilization,
                 seed: evalParams.seed,
                 api_concurrency: evalParams.api_concurrency,
+                api_timeout: evalParams.api_timeout,
+                api_max_retries: evalParams.api_max_retries,
             }
           : null;
       const stateUpdates: any = {
@@ -1131,6 +1140,8 @@ export const Eval = () => {
               gpu_memory_utilization: evalParams.gpu_memory_utilization,
               seed: evalParams.seed,
               api_concurrency: evalParams.api_concurrency,
+              api_timeout: evalParams.api_timeout,
+              api_max_retries: evalParams.api_max_retries,
           }));
       } else {
           // Single model mode (backward compatible)
@@ -1151,6 +1162,8 @@ export const Eval = () => {
               gpu_memory_utilization: evalParams.gpu_memory_utilization,
               seed: evalParams.seed,
               api_concurrency: evalParams.api_concurrency,
+              api_timeout: evalParams.api_timeout,
+              api_max_retries: evalParams.api_max_retries,
           }];
       }
 
@@ -1636,6 +1649,32 @@ export const Eval = () => {
                                        max="128"
                                        value={evalParams.api_concurrency}
                                        onChange={e => setEvalParams({ ...evalParams, api_concurrency: parseInt(e.target.value) || 1 })}
+                                       disabled={status === "running"}
+                                       className="h-9 bg-white border-slate-200 rounded-lg text-xs font-mono shadow-sm disabled:opacity-50 disabled:bg-slate-50/50"
+                                   />
+                               </div>
+                               <div className="col-span-3 min-w-0">
+                                   <label className="text-[10px] uppercase font-bold text-slate-400 mb-1.5 block px-1">API Timeout（API超时/秒）</label>
+                                   <Input
+                                       type="number"
+                                       step="5"
+                                       min="5"
+                                       max="600"
+                                       value={evalParams.api_timeout}
+                                       onChange={e => setEvalParams({ ...evalParams, api_timeout: parseInt(e.target.value) || 30 })}
+                                       disabled={status === "running"}
+                                       className="h-9 bg-white border-slate-200 rounded-lg text-xs font-mono shadow-sm disabled:opacity-50 disabled:bg-slate-50/50"
+                                   />
+                               </div>
+                               <div className="col-span-3 min-w-0">
+                                   <label className="text-[10px] uppercase font-bold text-slate-400 mb-1.5 block px-1">Max Retries（最大重试次数）</label>
+                                   <Input
+                                       type="number"
+                                       step="1"
+                                       min="0"
+                                       max="10"
+                                       value={evalParams.api_max_retries}
+                                       onChange={e => setEvalParams({ ...evalParams, api_max_retries: parseInt(e.target.value) || 3 })}
                                        disabled={status === "running"}
                                        className="h-9 bg-white border-slate-200 rounded-lg text-xs font-mono shadow-sm disabled:opacity-50 disabled:bg-slate-50/50"
                                    />
@@ -2321,6 +2360,34 @@ export const Eval = () => {
                                            max="128"
                                            value={evalParams.api_concurrency}
                                            onChange={e => setEvalParams({...evalParams, api_concurrency: parseInt(e.target.value) || 1})}
+                                           disabled={status === "running"}
+                                           className="h-9 bg-white border-emerald-200 rounded-lg focus-visible:ring-emerald-500/20 focus-visible:border-emerald-500 text-xs font-mono shadow-sm disabled:opacity-50 disabled:bg-slate-50/50"
+                                       />
+                                   </div>
+
+                                   <div className="col-span-3 min-w-0">
+                                       <label className="text-[10px] uppercase font-bold text-slate-400 mb-1.5 block px-1">API Timeout（API超时/秒）</label>
+                                       <Input
+                                           type="number"
+                                           step="5"
+                                           min="5"
+                                           max="600"
+                                           value={evalParams.api_timeout}
+                                           onChange={e => setEvalParams({...evalParams, api_timeout: parseInt(e.target.value) || 30})}
+                                           disabled={status === "running"}
+                                           className="h-9 bg-white border-emerald-200 rounded-lg focus-visible:ring-emerald-500/20 focus-visible:border-emerald-500 text-xs font-mono shadow-sm disabled:opacity-50 disabled:bg-slate-50/50"
+                                       />
+                                   </div>
+
+                                   <div className="col-span-3 min-w-0">
+                                       <label className="text-[10px] uppercase font-bold text-slate-400 mb-1.5 block px-1">Max Retries（最大重试次数）</label>
+                                       <Input
+                                           type="number"
+                                           step="1"
+                                           min="0"
+                                           max="10"
+                                           value={evalParams.api_max_retries}
+                                           onChange={e => setEvalParams({...evalParams, api_max_retries: parseInt(e.target.value) || 3})}
                                            disabled={status === "running"}
                                            className="h-9 bg-white border-emerald-200 rounded-lg focus-visible:ring-emerald-500/20 focus-visible:border-emerald-500 text-xs font-mono shadow-sm disabled:opacity-50 disabled:bg-slate-50/50"
                                        />

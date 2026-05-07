@@ -22,6 +22,73 @@ from one_eval.logger import get_logger
 log = get_logger("DataFlowEvalTool")
 
 
+class _APILLMServingWithTimeout(APILLMServing_request):
+    """APILLMServing_request 的子类：让 timeout 可由实例配置。
+
+    上游库的 timeout 是硬编码（api_chat=60s、_api_chat_with_id=1800s），
+    本子类重写两个方法，使用 self._request_timeout。
+    """
+
+    def __init__(self, *args, request_timeout: float = 30.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._request_timeout = float(request_timeout) if request_timeout and request_timeout > 0 else 30.0
+
+    def api_chat(self, system_info: str, messages: str, model: str):
+        import requests as _requests, json as _json, logging as _logging
+        try:
+            payload = _json.dumps({
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_info},
+                    {"role": "user", "content": messages},
+                ],
+                "temperature": 0.0,
+            })
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "User-Agent": "Apifox/1.0.0 (https://apifox.com)",
+            }
+            response = _requests.post(self.api_url, headers=headers, data=payload, timeout=self._request_timeout)
+            if response.status_code == 200:
+                return self.format_response(response.json())
+            _logging.error(f"API request failed with status {response.status_code}: {response.text}")
+            return None
+        except Exception as e:
+            _logging.error(f"API request error: {e}")
+            return None
+
+    def _api_chat_with_id(self, id, payload, model, is_embedding: bool = False, json_schema: dict = None):
+        import requests as _requests, json as _json, logging as _logging
+        try:
+            if is_embedding:
+                payload = _json.dumps({"model": model, "input": payload})
+            elif json_schema is None:
+                payload = _json.dumps({"model": model, "messages": payload})
+            else:
+                payload = _json.dumps({
+                    "model": model,
+                    "messages": payload,
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {"name": "custom_response", "strict": True, "schema": json_schema},
+                    },
+                })
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "User-Agent": "Apifox/1.0.0 (https://apifox.com)",
+            }
+            response = _requests.post(self.api_url, headers=headers, data=payload, timeout=self._request_timeout)
+            if response.status_code == 200:
+                return id, self.format_response(response.json(), is_embedding)
+            _logging.error(f"API request failed with status {response.status_code}: {response.text}")
+            return id, None
+        except Exception as e:
+            _logging.error(f"API request error: {e}")
+            return id, None
+
+
 class DataFlowEvalTool:
     """
     封装 DataFlow 的评测 Pipeline
@@ -109,10 +176,12 @@ class DataFlowEvalTool:
             with DataFlowEvalTool._init_lock:
                 if config.api_key:
                     os.environ["DF_API_KEY"] = config.api_key
-                serving = APILLMServing_request(
+                serving = _APILLMServingWithTimeout(
                     api_url=api_url,
                     model_name=model_name_or_path,
-                    max_workers=getattr(config, "api_concurrency", 16) or 16,
+                    max_workers=getattr(config, "api_concurrency", 1) or 1,
+                    max_retries=getattr(config, "api_max_retries", 3) or 3,
+                    request_timeout=getattr(config, "api_timeout", 30.0) or 30.0,
                 )
         else:
             serving = LocalModelLLMServing_vllm(

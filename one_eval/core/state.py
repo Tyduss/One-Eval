@@ -71,8 +71,10 @@ class ModelConfig:
     max_model_len: Optional[int] = None
     gpu_memory_utilization: float = 0.9
 
-    # API concurrency
-    api_concurrency: int = 16
+    # API concurrency & resilience
+    api_concurrency: int = 1
+    api_timeout: float = 30.0           # 单次 API 请求超时（秒）
+    api_max_retries: int = 3            # 失败后最大重试次数
 
 
 @dataclass
