@@ -154,6 +154,7 @@ class CustomAgent(BaseAgent):
             or os.getenv("OE_MODEL_NAME")
             or "gpt-4o"
         )
+        api_provider = os.getenv("OE_API_PROVIDER", "openai_compatible")
         return CustomLLMCaller(
             state=state,
             tool_manager=self.tool_manager,
@@ -161,6 +162,7 @@ class CustomAgent(BaseAgent):
             base_url=self.api_url,
             api_key=self.api_key,
             agent_role=self.role_name,
+            api_provider=api_provider,
         )
 
     def get_prompt(self, name: str, **kwargs) -> str:

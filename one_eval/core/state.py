@@ -56,7 +56,8 @@ class ModelConfig:
     is_api: bool = False
     api_url: Optional[str] = None
     api_key: Optional[str] = None
-    
+    api_provider: str = "openai_compatible"  # "openai_compatible" | "anthropic"
+
     # Generation parameters
     temperature: float = 0.0
     top_p: float = 1.0

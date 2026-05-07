@@ -50,6 +50,7 @@ def compute_case_study_analyst(preds: List[Any], refs: List[Any], **kwargs) -> D
     model_name = kwargs.get("model_name", "gpt-4o")
     api_key = kwargs.get("api_key") or os.environ.get("OE_API_KEY")
     base_url = kwargs.get("base_url") or os.environ.get("OE_API_BASE")
+    api_provider = kwargs.get("api_provider") or os.environ.get("OE_API_PROVIDER", "openai_compatible")
     
     # Try to retrieve real state from kwargs (if passed by caller)
     real_state = kwargs.get("state", None)
@@ -170,6 +171,7 @@ def compute_case_study_analyst(preds: List[Any], refs: List[Any], **kwargs) -> D
             model_name=model_name,
             base_url=base_url or "http://123.129.219.111:3000/v1", # fallback
             api_key=api_key,
+            api_provider=api_provider,
             temperature=0.7
         )
         
@@ -259,7 +261,8 @@ def compute_metric_summary_analyst(preds: List[Any], refs: List[Any], **kwargs) 
     model_name = kwargs.get("model_name", "gpt-4o")
     api_key = kwargs.get("api_key") or os.environ.get("OE_API_KEY", "sk-xxx")
     base_url = kwargs.get("base_url") or os.environ.get("OE_API_BASE", "http://123.129.219.111:3000/v1")
-    
+    api_provider = kwargs.get("api_provider") or os.environ.get("OE_API_PROVIDER", "openai_compatible")
+
     # Try to retrieve real state from kwargs (if passed by caller)
     real_state = kwargs.get("state", None)
 
@@ -324,7 +327,8 @@ Do not output markdown horizontal rules like ---.
             agent_role="MetricSummaryAnalyst",
             model_name=model_name,
             base_url=base_url,
-            api_key=api_key
+            api_key=api_key,
+            api_provider=api_provider
         )
         
         messages = [

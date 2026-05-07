@@ -97,6 +97,7 @@ class LLMJudge:
                 model_name=jc.model_name_or_path,
                 base_url=api_url,
                 api_key=jc.api_key or "",
+                api_provider=getattr(jc, "api_provider", "openai_compatible"),
                 temperature=0.0,
             )
         return self._caller

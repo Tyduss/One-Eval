@@ -213,12 +213,29 @@ def _normalize_openai_base_url(url: str) -> str:
         u = u[:-1]
     return u
 
+
+def _normalize_anthropic_base_url(url: str) -> str:
+    """确保 Anthropic URL 以 /v1 结尾（不含尾斜杠）。"""
+    u = (url or "").strip().rstrip("/")
+    if not u:
+        return u
+    # 去掉已有的路径后缀
+    for suffix in ("/v1/messages", "/messages"):
+        if u.endswith(suffix):
+            u = u[: -len(suffix)]
+            break
+    # 确保 /v1 存在
+    if not u.endswith("/v1"):
+        u = u + "/v1"
+    return u
+
 def apply_agent_env_from_config(cfg: Dict[str, Any]) -> None:
     agent = cfg.get("agent") or {}
     base_url = agent.get("base_url")
     api_key = agent.get("api_key")
     model = agent.get("model")
     timeout_s = agent.get("timeout_s")
+    provider = agent.get("provider")
     if isinstance(base_url, str) and base_url.strip():
         os.environ["OE_API_BASE"] = _normalize_openai_base_url(base_url.strip())
         os.environ["DF_API_BASE_URL"] = _normalize_openai_base_url(base_url.strip())
@@ -231,6 +248,8 @@ def apply_agent_env_from_config(cfg: Dict[str, Any]) -> None:
     if isinstance(timeout_s, int) and timeout_s > 0:
         os.environ["OE_TIMEOUT_S"] = str(timeout_s)
         os.environ["DF_TIMEOUT_S"] = str(timeout_s)
+    if isinstance(provider, str) and provider.strip():
+        os.environ["OE_API_PROVIDER"] = provider.strip()
 
 # Initialize Env ASAP
 _cfg0 = load_server_config()
@@ -495,12 +514,22 @@ async def test_agent_config(req: Optional[AgentTestRequest] = None):
     base_url = agent.get("base_url") or ""
     if req and req.base_url and req.base_url.strip():
         base_url = req.base_url.strip()
-    base_url = _normalize_openai_base_url(base_url)
+
+    # 先确定协议类型（从请求或已保存的配置中）
+    provider = agent.get("provider") or "openai_compatible"
+    if req and req.provider and req.provider.strip():
+        provider = req.provider.strip()
+
+    # 根据协议类型使用对应的 URL 规范化
+    if provider == "anthropic":
+        base_url = _normalize_anthropic_base_url(base_url)
+    else:
+        base_url = _normalize_openai_base_url(base_url)
 
     api_key = agent.get("api_key")
     if req and req.api_key is not None:
         api_key = req.api_key.strip()
-    
+
     model = agent.get("model") or "gpt-4o"
     if req and req.model and req.model.strip():
         model = req.model.strip()
@@ -509,44 +538,60 @@ async def test_agent_config(req: Optional[AgentTestRequest] = None):
     if req and req.timeout_s and req.timeout_s > 0:
         timeout_s = req.timeout_s
 
-    headers: Dict[str, str] = {"Content-Type": "application/json"}
-    if isinstance(api_key, str) and api_key.strip():
-        headers["Authorization"] = f"Bearer {api_key.strip()}"
+    if provider == "anthropic":
+        # Anthropic Messages API
+        headers: Dict[str, str] = {"Content-Type": "application/json", "anthropic-version": "2023-06-01"}
+        if isinstance(api_key, str) and api_key.strip():
+            headers["x-api-key"] = api_key.strip()
+        chat_url = f"{base_url}/messages"
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 5,
+        }
+    else:
+        # OpenAI-compatible
+        headers: Dict[str, str] = {"Content-Type": "application/json"}
+        if isinstance(api_key, str) and api_key.strip():
+            headers["Authorization"] = f"Bearer {api_key.strip()}"
+        chat_url = f"{base_url}/chat/completions"
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": "ping"}],
+        }
 
     models_ok = False
     models_status: Optional[int] = None
     models_detail = ""
     async with httpx.AsyncClient(timeout=timeout_s) as client:
-        try:
-            r = await client.get(f"{base_url}/models", headers=headers)
-            if r.status_code == 200:
-                models_ok = True
-                models_status = r.status_code
-                models_detail = "GET /models ok"
-        except Exception:
-            pass
+        # /models 仅对 OpenAI 兼容协议有意义
+        if provider != "anthropic":
+            try:
+                r = await client.get(f"{base_url}/models", headers=headers)
+                if r.status_code == 200:
+                    models_ok = True
+                    models_status = r.status_code
+                    models_detail = "GET /models ok"
+            except Exception:
+                pass
 
-        payload = {
-            "model": model,
-            "messages": [{"role": "user", "content": "ping"}],
-        }
-        
         try:
-            r = await client.post(f"{base_url}/chat/completions", headers=headers, json=payload)
+            r = await client.post(chat_url, headers=headers, json=payload)
             if 200 <= r.status_code < 300:
-                detail = "POST /chat/completions ok"
+                endpoint_name = "/messages" if provider == "anthropic" else "/chat/completions"
+                detail = f"POST {endpoint_name} ok"
                 if models_ok:
                     detail = f"{models_detail}; {detail}"
                 return {"ok": True, "status_code": r.status_code, "detail": detail, "mode": "chat"}
-            
+
             try:
                 err_detail = r.json()
             except:
                 err_detail = r.text[:200]
-                
+
             if r.status_code in (401, 403):
                 return {"ok": False, "status_code": r.status_code, "detail": f"Unauthorized: {err_detail}", "mode": "chat"}
-            
+
             return {"ok": False, "status_code": r.status_code, "detail": f"Request failed: {err_detail}", "mode": "chat"}
         except Exception as e:
             if models_ok:
@@ -573,6 +618,7 @@ class StartWorkflowRequest(BaseModel):
     is_api: bool = False
     api_url: Optional[str] = None
     api_key: Optional[str] = None
+    api_provider: str = "openai_compatible"
     # Multi-model support
     target_models: Optional[List[Dict[str, Any]]] = None
 
@@ -641,6 +687,7 @@ async def start_workflow(req: StartWorkflowRequest):
                 is_api=m.get("is_api", False),
                 api_url=m.get("api_url"),
                 api_key=m.get("api_key"),
+                api_provider=m.get("api_provider", "openai_compatible"),
                 tensor_parallel_size=m.get("tensor_parallel_size", req.tensor_parallel_size),
                 max_tokens=m.get("max_tokens", req.max_tokens),
                 temperature=m.get("temperature", req.temperature),
@@ -660,6 +707,7 @@ async def start_workflow(req: StartWorkflowRequest):
             is_api=req.is_api,
             api_url=req.api_url,
             api_key=req.api_key,
+            api_provider=req.api_provider,
             tensor_parallel_size=req.tensor_parallel_size,
             max_tokens=req.max_tokens,
             temperature=req.temperature,
@@ -878,6 +926,7 @@ async def resume_workflow(thread_id: str, req: ResumeWorkflowRequest):
                     is_api=bool(tm.get("is_api", False)),
                     api_url=tm.get("api_url"),
                     api_key=tm.get("api_key"),
+                    api_provider=tm.get("api_provider", "openai_compatible"),
                     temperature=float(tm.get("temperature", 0.0) or 0.0),
                     top_p=float(tm.get("top_p", 1.0) or 1.0),
                     top_k=int(tm.get("top_k", -1) if tm.get("top_k", -1) is not None else -1),
@@ -1017,6 +1066,7 @@ async def rerun_execution(thread_id: str, req: RerunExecutionRequest):
                         is_api=bool(tm.get("is_api", False)),
                         api_url=tm.get("api_url"),
                         api_key=tm.get("api_key"),
+                        api_provider=tm.get("api_provider", "openai_compatible"),
                         temperature=float(tm.get("temperature", 0.0) or 0.0),
                         top_p=float(tm.get("top_p", 1.0) or 1.0),
                         top_k=int(tm.get("top_k", -1) if tm.get("top_k", -1) is not None else -1),
@@ -1094,6 +1144,7 @@ async def manual_start(req: ManualStartRequest):
                 is_api=bool(tm.get("is_api", False)),
                 api_url=tm.get("api_url"),
                 api_key=tm.get("api_key"),
+                api_provider=tm.get("api_provider", "openai_compatible"),
                 temperature=float(tm.get("temperature", 0.0) or 0.0),
                 top_p=float(tm.get("top_p", 1.0) or 1.0),
                 top_k=int(tm.get("top_k", -1) if tm.get("top_k", -1) is not None else -1),
@@ -1122,6 +1173,7 @@ async def manual_start(req: ManualStartRequest):
                 is_api=bool(tm.get("is_api", False)),
                 api_url=tm.get("api_url"),
                 api_key=tm.get("api_key"),
+                api_provider=tm.get("api_provider", "openai_compatible"),
                 temperature=float(tm.get("temperature", 0.0) or 0.0),
                 top_p=float(tm.get("top_p", 1.0) or 1.0),
                 top_k=int(tm.get("top_k", -1) if tm.get("top_k", -1) is not None else -1),
@@ -1644,6 +1696,7 @@ class ModelTestRequest(BaseModel):
     path: Optional[str] = None
     api_url: Optional[str] = None
     api_key: Optional[str] = None
+    api_provider: str = "openai_compatible"
 
 @app.post("/api/models/test")
 def test_model(req: ModelTestRequest):
@@ -1653,23 +1706,32 @@ def test_model(req: ModelTestRequest):
         if not req.api_url or not req.path:
             raise HTTPException(status_code=400, detail="api_url and path (model name) are required for API models")
 
-        base_url = _normalize_openai_base_url(req.api_url.strip())
-        headers = {"Content-Type": "application/json"}
-        if req.api_key and req.api_key.strip():
-            headers["Authorization"] = f"Bearer {req.api_key.strip()}"
-
+        base_url = _normalize_anthropic_base_url(req.api_url.strip()) if req.api_provider == "anthropic" else _normalize_openai_base_url(req.api_url.strip())
         payload = {
             "model": req.path.strip(),
             "messages": [{"role": "user", "content": "ping"}],
             "max_tokens": 5,
         }
 
+        if req.api_provider == "anthropic":
+            # Anthropic Messages API
+            headers = {"Content-Type": "application/json", "anthropic-version": "2023-06-01"}
+            if req.api_key and req.api_key.strip():
+                headers["x-api-key"] = req.api_key.strip()
+            test_url = f"{base_url}/messages"
+        else:
+            # OpenAI-compatible
+            headers = {"Content-Type": "application/json"}
+            if req.api_key and req.api_key.strip():
+                headers["Authorization"] = f"Bearer {req.api_key.strip()}"
+            test_url = f"{base_url}/chat/completions"
+
         try:
             import httpx
             with httpx.Client(timeout=30.0) as client:
-                r = client.post(f"{base_url}/chat/completions", headers=headers, json=payload)
+                r = client.post(test_url, headers=headers, json=payload)
                 if 200 <= r.status_code < 300:
-                    return {"ok": True, "detail": "API connection successful"}
+                    return {"ok": True, "detail": f"API connection successful ({req.api_provider})"}
                 try:
                     err_detail = r.json()
                 except:
@@ -2537,6 +2599,7 @@ async def start_judge(req: JudgeStartRequest):
         is_api=True,
         api_url=judge_api_url,
         api_key=judge_api_key,
+        api_provider=req.judge_model.get("api_provider", "openai_compatible"),
         temperature=0.0,
         max_tokens=4096,
     )
@@ -2864,33 +2927,53 @@ async def generate_judge_report(task_id: str):
         api_url = agent_cfg.get("base_url", "")
         api_key = agent_cfg.get("api_key", "")
         model_name = agent_cfg.get("model", "")
+        agent_provider = agent_cfg.get("provider", "openai_compatible")
 
         if not api_url or not api_key or not model_name:
             raise HTTPException(status_code=500, detail="Agent LLM not configured for report generation")
 
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": model_name,
-            "messages": [
-                {"role": "system", "content": "你是一个专业的 AI 模型评测分析师，擅长基于评测数据进行深度分析并生成结构化报告。"},
-                {"role": "user", "content": analysis_prompt},
-            ],
-            "temperature": 0.3,
-            "max_tokens": 4096,
-        }
+        system_content = "你是一个专业的 AI 模型评测分析师，擅长基于评测数据进行深度分析并生成结构化报告。"
 
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(
-                f"{api_url}/chat/completions",
-                headers=headers,
-                json=payload,
-            )
-            resp.raise_for_status()
-            llm_response = resp.json()
-            analysis_text = llm_response["choices"][0]["message"]["content"]
+        if agent_provider == "anthropic":
+            headers = {
+                "x-api-key": api_key,
+                "Content-Type": "application/json",
+                "anthropic-version": "2023-06-01",
+            }
+            payload = {
+                "model": model_name,
+                "system": system_content,
+                "messages": [{"role": "user", "content": analysis_prompt}],
+                "temperature": 0.3,
+                "max_tokens": 4096,
+            }
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.post(f"{api_url}/messages", headers=headers, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+                content_blocks = data.get("content", [])
+                analysis_text = "".join(
+                    block.get("text", "") for block in content_blocks if block.get("type") == "text"
+                )
+        else:
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": system_content},
+                    {"role": "user", "content": analysis_prompt},
+                ],
+                "temperature": 0.3,
+                "max_tokens": 4096,
+            }
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.post(f"{api_url}/chat/completions", headers=headers, json=payload)
+                resp.raise_for_status()
+                llm_response = resp.json()
+                analysis_text = llm_response["choices"][0]["message"]["content"]
 
     except Exception as e:
         log.error(f"Report generation failed for {task_id}: {e}", exc_info=True)

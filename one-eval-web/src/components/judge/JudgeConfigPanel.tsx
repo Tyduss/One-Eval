@@ -53,6 +53,7 @@ export default function JudgeConfigPanel({ apiBaseUrl, models, onStart, lang }: 
   const [judgeModelName, setJudgeModelName] = useState('');
   const [judgeApiUrl, setJudgeApiUrl] = useState('');
   const [judgeApiKey, setJudgeApiKey] = useState('');
+  const [judgeApiProvider, setJudgeApiProvider] = useState('openai_compatible');
   const [concurrency, setConcurrency] = useState(5);
   const [selectedModels, setSelectedModels] = useState<string[]>(
     models.map(m => m.model_name)
@@ -88,6 +89,7 @@ export default function JudgeConfigPanel({ apiBaseUrl, models, onStart, lang }: 
         model_name_or_path: judgeModelName.trim(),
         api_url: judgeApiUrl.trim(),
         api_key: judgeApiKey.trim(),
+        api_provider: judgeApiProvider,
       },
       concurrency,
       selectedModels,
@@ -168,6 +170,22 @@ export default function JudgeConfigPanel({ apiBaseUrl, models, onStart, lang }: 
                      focus:outline-none focus:ring-2 focus:ring-blue-400"
           placeholder="https://api.openai.com/v1"
         />
+      </div>
+
+      <div>
+        <label className="block text-xs font-medium text-slate-500 mb-1">
+          {tt('裁判 API 协议', 'Judge API Protocol')}
+        </label>
+        <select
+          title={tt('选择 API 协议', 'Select API Protocol')}
+          value={judgeApiProvider}
+          onChange={e => setJudgeApiProvider(e.target.value)}
+          className="w-full border border-slate-200 rounded-lg px-3 py-1.5 text-xs
+                     focus:outline-none focus:ring-2 focus:ring-blue-400"
+        >
+          <option value="openai_compatible">{tt('OpenAI 兼容', 'OpenAI Compatible')}</option>
+          <option value="anthropic">Anthropic</option>
+        </select>
       </div>
 
       {/* Model Selection */}

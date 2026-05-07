@@ -50,6 +50,7 @@ class CustomLLMCaller(BaseLLMCaller):
         model_name: Optional[str],
         base_url: str,
         api_key: str,
+        api_provider: str = "openai_compatible",
         temperature: float = 0.0
     ):
         super().__init__(
@@ -62,17 +63,28 @@ class CustomLLMCaller(BaseLLMCaller):
         self.agent_role = agent_role   # 保存 agent 的真实角色名
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
+        self.api_provider = api_provider  # "openai_compatible" | "anthropic"
         timeout_s = int(os.getenv("OE_TIMEOUT_S") or os.getenv("DF_TIMEOUT_S") or 60)
         if timeout_s <= 0:
             timeout_s = 60
         if not self.model_name:
             self.model_name = os.getenv("DF_MODEL_NAME") or os.getenv("OE_MODEL_NAME") or "gpt-4o"
-        self._client = httpx.AsyncClient(
-            timeout=timeout_s,
-            headers={
+
+        # 根据协议类型构建不同的请求头
+        if self.api_provider == "anthropic":
+            default_headers = {
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            }
+        else:
+            default_headers = {
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
-            },
+            }
+        self._client = httpx.AsyncClient(
+            timeout=timeout_s,
+            headers=default_headers,
         )
 
     # ------------------------------
@@ -127,7 +139,87 @@ class CustomLLMCaller(BaseLLMCaller):
             "content": m.content or "",
         }
 
+    # ------------------------------
+    #  Anthropic 消息转换与调用
+    # ------------------------------
+
+    def _convert_messages_anthropic(self, messages: List[BaseMessage]):
+        """
+        将 LangChain 消息转换为 Anthropic API 格式。
+        Anthropic 要求 system 消息作为独立参数，不在 messages 数组中。
+        返回 (system_text, formatted_messages)。
+        """
+        system_parts = []
+        formatted = []
+        for m in messages:
+            if m.type == "system":
+                system_parts.append(str(m.content))
+            elif m.type == "human":
+                formatted.append({"role": "user", "content": str(m.content)})
+            elif isinstance(m, AIMessage):
+                if m.additional_kwargs.get("tool_calls"):
+                    log.warning("Tool calls with Anthropic provider are not fully supported in raw API mode")
+                    formatted.append({"role": "assistant", "content": str(m.content or "")})
+                else:
+                    formatted.append({"role": "assistant", "content": str(m.content or "")})
+            elif m.type == "tool":
+                # Anthropic tool result format is different; basic fallback
+                formatted.append({"role": "user", "content": str(m.content)})
+            else:
+                formatted.append({"role": "user", "content": str(m.content)})
+
+        system_text = "\n\n".join(system_parts) if system_parts else None
+        return system_text, formatted
+
+    async def _call_raw_api_anthropic(self, messages: List[BaseMessage]) -> AIMessage:
+        """调用 Anthropic Messages API"""
+        # 确保 URL 包含 /v1
+        base = self.base_url
+        if not base.endswith("/v1"):
+            base = base + "/v1"
+        api_url = f"{base}/messages"
+
+        system_text, formatted = self._convert_messages_anthropic(messages)
+
+        payload = {
+            "model": self.model_name,
+            "messages": formatted,
+            "max_tokens": self.max_tokens,
+        }
+        if system_text:
+            payload["system"] = system_text
+        if self.temperature > 0:
+            payload["temperature"] = self.temperature
+
+        retry_statuses = {429, 502, 503, 504, 529}
+        last_err = None
+        for attempt in range(3):
+            try:
+                r = await self._client.post(api_url, json=payload)
+                if r.status_code in retry_statuses and attempt < 2:
+                    await asyncio.sleep(0.6 * (attempt + 1))
+                    continue
+                r.raise_for_status()
+                data = r.json()
+                # Anthropic 响应: data["content"][0]["text"]
+                content_blocks = data.get("content", [])
+                text = "".join(
+                    block.get("text", "") for block in content_blocks if block.get("type") == "text"
+                )
+                return AIMessage(content=text)
+            except Exception as e:
+                last_err = e
+                if attempt < 2:
+                    await asyncio.sleep(0.6 * (attempt + 1))
+                    continue
+                raise
+
+        raise last_err
+
     async def _call_raw_api(self, messages: List[BaseMessage]) -> AIMessage:
+        if self.api_provider == "anthropic":
+            return await self._call_raw_api_anthropic(messages)
+
         api_url = f"{self.base_url}/chat/completions"
 
         formatted_messages = [self._convert_lc_message(m) for m in messages]
@@ -172,6 +264,11 @@ class CustomLLMCaller(BaseLLMCaller):
         # 1) 无工具模式 —— 使用你自己的 API（这是大多数情况）
         # =====================================================
         if not bind_post_tools:
+            return await self._call_raw_api(messages)
+
+        # Anthropic 模式下不支持 ChatOpenAI.bind_tools，回退到原始 API
+        if self.api_provider == "anthropic":
+            log.warning("[CustomLLMCaller] Tool binding not supported for Anthropic provider, using raw API")
             return await self._call_raw_api(messages)
 
         # =====================================================

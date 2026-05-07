@@ -17,6 +17,7 @@ interface ModelConfig {
   is_api?: boolean;
   api_url?: string;
   api_key?: string;
+  api_provider?: string; // "openai_compatible" | "anthropic"
 }
 
 interface SettingsCardProps {
@@ -84,9 +85,9 @@ export const Settings = () => {
   const tt = (zh: string, en: string) => (lang === "zh" ? zh : en);
   const [models, setModels] = useState<ModelConfig[]>([]);
   const [selectedModelIdxs, setSelectedModelIdxs] = useState<Set<number>>(new Set());
-  const [newModel, setNewModel] = useState<ModelConfig>({ name: "", path: "", is_api: false, api_url: "", api_key: "" });
+  const [newModel, setNewModel] = useState<ModelConfig>({ name: "", path: "", is_api: false, api_url: "", api_key: "", api_provider: "openai_compatible" });
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
-  const [editModel, setEditModel] = useState<ModelConfig>({ name: "", path: "", is_api: false, api_url: "", api_key: "" });
+  const [editModel, setEditModel] = useState<ModelConfig>({ name: "", path: "", is_api: false, api_url: "", api_key: "", api_provider: "openai_compatible" });
   const [loading, setLoading] = useState(false);
   const [apiBaseUrl] = useState(() => localStorage.getItem("oneEval.apiBaseUrl") || "http://localhost:8000");
   const [hfEndpoint, setHfEndpoint] = useState("https://hf-mirror.com");
@@ -100,6 +101,7 @@ export const Settings = () => {
   const [agentApiKeyInput, setAgentApiKeyInput] = useState("");
   const [agentApiKeySet, setAgentApiKeySet] = useState(false);
   const [agentTimeoutS, setAgentTimeoutS] = useState(15);
+  const [agentProvider, setAgentProvider] = useState("openai_compatible");
   const [savingAgent, setSavingAgent] = useState(false);
   const [testingAgent, setTestingAgent] = useState(false);
   const [agentTestResult, setAgentTestResult] = useState<string | null>(null);
@@ -111,6 +113,7 @@ export const Settings = () => {
     () => [
       { label: "yuchaAPI", value: "http://123.129.219.111:3000/v1/chat/completions" },
       { label: "OpenAI", value: "https://api.openai.com/v1" },
+      { label: "Anthropic", value: "https://api.anthropic.com/v1" },
       { label: "OpenRouter", value: "https://openrouter.ai/api/v1" },
       { label: "Apiyi (OpenAI Compatible)", value: "https://api.apiyi.com/v1" },
       { label: "Custom...", value: "__custom__" },
@@ -231,12 +234,14 @@ export const Settings = () => {
       const res = await axios.get(`${apiBaseUrl}/api/config/agent`);
       setAgentBaseUrl(res.data.base_url || "http://123.129.219.111:3000/v1");
       setAgentModel(res.data.model || "gpt-4o");
+      setAgentProvider(res.data.provider || "openai_compatible");
       setAgentApiKeySet(Boolean(res.data.api_key_set));
       setAgentTimeoutS(Number(res.data.timeout_s || 15));
       setAgentApiKeyInput("");
     } catch (e) {
       setAgentBaseUrl("http://123.129.219.111:3000/v1");
       setAgentModel("gpt-4o");
+      setAgentProvider("openai_compatible");
       setAgentApiKeySet(false);
       setAgentTimeoutS(15);
       setAgentApiKeyInput("");
@@ -249,12 +254,14 @@ export const Settings = () => {
       const payload: any = {
         base_url: agentBaseUrl,
         model: agentModel,
+        provider: agentProvider,
         timeout_s: agentTimeoutS,
       };
       if (agentApiKeyInput.trim()) payload.api_key = agentApiKeyInput.trim();
       const res = await axios.post(`${apiBaseUrl}/api/config/agent`, payload);
       setAgentBaseUrl(res.data.base_url || agentBaseUrl);
       setAgentModel(res.data.model || agentModel);
+      setAgentProvider(res.data.provider || agentProvider);
       setAgentApiKeySet(Boolean(res.data.api_key_set));
       setAgentTimeoutS(Number(res.data.timeout_s || agentTimeoutS));
       // Keep the input and result visible so user knows what happened
@@ -288,6 +295,7 @@ export const Settings = () => {
       const payload: any = {
         base_url: agentBaseUrl,
         model: agentModel,
+        provider: agentProvider,
         timeout_s: agentTimeoutS,
       };
       // Send the currently input API key if it's not empty, otherwise don't send it (let backend use saved key)
@@ -353,6 +361,7 @@ export const Settings = () => {
         path: model.path,
         api_url: model.api_url,
         api_key: model.api_key,
+        api_provider: model.api_provider || "openai_compatible",
       });
       const ok = !!res.data?.ok;
       setModelTestMsg((prev) => ({
@@ -422,7 +431,15 @@ export const Settings = () => {
                   value={agentUrlPresetValue}
                   onChange={(e) => {
                     const v = e.target.value;
-                    if (v !== "__custom__") setAgentBaseUrl(v);
+                    if (v !== "__custom__") {
+                      setAgentBaseUrl(v);
+                      // 选择 Anthropic 预设时自动切换协议
+                      if (v === "https://api.anthropic.com/v1") {
+                        setAgentProvider("anthropic");
+                      } else if (agentProvider === "anthropic") {
+                        setAgentProvider("openai_compatible");
+                      }
+                    }
                   }}
                   className="w-full h-10 rounded-md border border-slate-200 bg-white px-3 text-sm text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-300"
                 >
@@ -438,6 +455,19 @@ export const Settings = () => {
                   placeholder={tt("例如：https://api.openai.com/v1", "e.g. https://api.openai.com/v1")}
                 />
               </div>
+            </div>
+
+            <div className="space-y-2">
+              <Label>{tt("API 协议", "API Protocol")}</Label>
+              <select
+                title={tt("选择 API 协议", "Select API Protocol")}
+                value={agentProvider}
+                onChange={(e) => setAgentProvider(e.target.value)}
+                className="w-full h-10 rounded-md border border-slate-200 bg-white px-3 text-sm text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-300"
+              >
+                <option value="openai_compatible">{tt("OpenAI 兼容", "OpenAI Compatible")}</option>
+                <option value="anthropic">Anthropic</option>
+              </select>
             </div>
 
             <div className="grid grid-cols-2 gap-4">
@@ -668,6 +698,18 @@ export const Settings = () => {
                     />
                   </div>
                   <div className="space-y-2">
+                    <Label>{tt("API 协议", "API Protocol")}</Label>
+                    <select
+                      title={tt("选择 API 协议", "Select API Protocol")}
+                      value={newModel.api_provider || "openai_compatible"}
+                      onChange={e => setNewModel({...newModel, api_provider: e.target.value})}
+                      className="w-full h-10 rounded-md border border-slate-200 bg-white px-3 text-sm text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-300"
+                    >
+                      <option value="openai_compatible">{tt("OpenAI 兼容", "OpenAI Compatible")}</option>
+                      <option value="anthropic">Anthropic</option>
+                    </select>
+                  </div>
+                  <div className="space-y-2">
                     <Label>{tt("模型标识（必填）", "Model Identifier (Required)")}</Label>
                     <Input
                       placeholder="gpt-4o / deepseek-v3 / ..."
@@ -800,6 +842,18 @@ export const Settings = () => {
                               />
                             </div>
                             <div className="space-y-2">
+                              <Label>{tt("API 协议", "API Protocol")}</Label>
+                              <select
+                                title={tt("选择 API 协议", "Select API Protocol")}
+                                value={editModel.api_provider || "openai_compatible"}
+                                onChange={e => setEditModel({...editModel, api_provider: e.target.value})}
+                                className="w-full h-10 rounded-md border border-slate-200 bg-white px-3 text-sm text-slate-900"
+                              >
+                                <option value="openai_compatible">{tt("OpenAI 兼容", "OpenAI Compatible")}</option>
+                                <option value="anthropic">Anthropic</option>
+                              </select>
+                            </div>
+                            <div className="space-y-2">
                               <Label>{tt("模型标识（必填）", "Model Identifier (Required)")}</Label>
                               <Input
                                 value={editModel.path}
@@ -864,7 +918,8 @@ export const Settings = () => {
                           <div className="flex-1 min-w-0">
                             <div className="flex items-center gap-2">
                               <span className="font-semibold text-slate-900">{m.name}</span>
-                              {m.is_api && <span className="text-xs px-2 py-0.5 rounded-full bg-violet-100 text-violet-700">API</span>}
+                              {m.is_api && m.api_provider === "anthropic" && <span className="text-xs px-2 py-0.5 rounded-full bg-orange-100 text-orange-700">Anthropic</span>}
+                              {m.is_api && m.api_provider !== "anthropic" && <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700">OpenAI</span>}
                             </div>
                             <div className="text-xs text-slate-500 truncate font-mono mt-1" title={m.is_api ? m.api_url : m.path}>
                               {m.is_api ? `${m.api_url} → ${m.path}` : m.path}
