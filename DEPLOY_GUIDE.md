@@ -68,7 +68,7 @@ open http://127.0.0.1:8000/docs
 ## 3. 前端部署
 
 ```bash
-cd one-eval-web
+cd ~/One-Eval/one-eval-web
 npm install
 npm run dev
 ```
