@@ -88,8 +88,16 @@ class LLMJudge:
         if self._caller is None:
             jc = self.config.judge_model
             api_url = jc.api_url or ""
-            if api_url and not api_url.endswith("/v1"):
-                api_url = api_url.rstrip("/") + "/v1"
+            # OpenAI-compatible base_url：build_url + version path。
+            # 不同厂商的形式：
+            #   - https://api.openai.com/v1                 ← OpenAI
+            #   - https://open.bigmodel.cn/api/paas/v4      ← 智谱 GLM
+            #   - https://ark.cn-beijing.volces.com/api/v3  ← Volcengine
+            # 用户传啥就用啥，由 SDK 自动拼 `/chat/completions`。
+            # 但如果用户误传了完整的 endpoint（带 /chat/completions 后缀），把它剥掉。
+            api_url = api_url.rstrip("/")
+            if api_url.endswith("/chat/completions"):
+                api_url = api_url[: -len("/chat/completions")].rstrip("/")
             self._caller = CustomLLMCaller(
                 state=MockState(jc.model_name_or_path),
                 tool_manager=None,

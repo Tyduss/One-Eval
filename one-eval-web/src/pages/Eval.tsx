@@ -30,6 +30,10 @@ interface StatusResponse {
     generated?: number;
     total?: number;
     percent?: number;
+    status?: string;
+    error?: string;
+    consecutive_failures?: number;
+    max_failures?: number;
   }>;
 }
 
@@ -85,6 +89,12 @@ export const Eval = () => {
   });
   const [interruptToken, setInterruptToken] = useState<string | null>(null);
   const [evalProgress, setEvalProgress] = useState<StatusResponse["eval_progress"]>([]);
+  // SSE/workflow_meta 状态：SSE 主推、轮询降级。
+  // - sseAlive=true 表示 EventSource 已收到 snapshot，轮询会自动暂停。
+  // - workflowMeta 是 per-bench×per-model 的状态/进度持久化镜像，
+  //   失败模型也会出现在里面（不像 state.benches 只反映 success 的）。
+  const [sseAlive, setSseAlive] = useState(false);
+  const [workflowMeta, setWorkflowMeta] = useState<any>(null);
   
   // History
   const [history, setHistory] = useState<HistoryItem[]>([]);
@@ -472,9 +482,133 @@ export const Eval = () => {
       fetchHistory();
   }, [apiBaseUrl, status]); 
 
+  // SSE 主推：订阅 /api/workflow/events/{tid}，把 per-bench×per-model 状态/进度
+  // 实时更新到 evalProgress / workflowMeta。SSE 握手成功 (sseAlive=true)
+  // 之后下面的 polling useEffect 会因为 `sseAlive` 守卫而自动暂停；
+  // 一旦 SSE 失败或断开（onerror），sseAlive 复位为 false，polling 自动接管。
+  useEffect(() => {
+    if (!threadId) return;
+    if (["completed", "failed", "stopped"].includes(status)) return;
+
+    let cancelled = false;
+    const es = new EventSource(`${apiBaseUrl}/api/workflow/events/${threadId}`);
+
+    const mergeProgress = (
+      prev: StatusResponse["eval_progress"] | undefined,
+      payload: Record<string, any>,
+    ): StatusResponse["eval_progress"] => {
+      const list = Array.isArray(prev) ? [...prev] : [];
+      const modelKey = payload?.model_name || payload?.model;
+      // 用 model_name 做 idempotent key；如果没有 model_name 就追加。
+      const idx = modelKey
+        ? list.findIndex((p) => (p?.model_name || (p as any)?.model) === modelKey)
+        : -1;
+      if (idx >= 0) {
+        list[idx] = { ...list[idx], ...payload };
+      } else {
+        list.push(payload);
+      }
+      return list;
+    };
+
+    // Merge a single SSE progress payload into the workflowMeta snapshot.
+    // 后端会推：{bench_name, model_name, stage, generated, total, percent,
+    //           consecutive_failures, max_failures, last_error, batch_status,
+    //           status, error}
+    // 我们需要把它平铺到 workflowMeta.benches[bench].models[model] 下。
+    const mergeMeta = (
+      prev: any,
+      payload: Record<string, any>,
+    ): any => {
+      const benchName = payload?.bench_name;
+      const modelName = payload?.model_name || payload?.model;
+      if (!benchName || !modelName) return prev;
+      const base = prev && typeof prev === "object" ? prev : {};
+      const benches = { ...(base.benches || {}) };
+      const benchEntry = benches[benchName] || { models: {} };
+      const models = { ...(benchEntry.models || {}) };
+      const slot = { ...(models[modelName] || {}) };
+
+      if (payload.stage !== undefined) slot.stage = payload.stage;
+      if (payload.generated !== undefined) slot.generated = payload.generated;
+      if (payload.total !== undefined) slot.total = payload.total;
+      if (payload.percent !== undefined) slot.percent = payload.percent;
+      if (payload.status !== undefined) slot.status = payload.status;
+      if (payload.error !== undefined) slot.error = payload.error;
+      if (payload.consecutive_failures !== undefined) slot.consecutive_failures = payload.consecutive_failures;
+      if (payload.max_failures !== undefined) slot.max_failures = payload.max_failures;
+      if (payload.last_error !== undefined) slot.last_error = payload.last_error;
+      // batch_status 是 dict，扁平化几个常用字段也存一份。
+      const bs = payload.batch_status;
+      if (bs && typeof bs === "object") {
+        if (typeof bs.failures === "number") slot.failures = bs.failures;
+        if (typeof bs.successes === "number") slot.successes = bs.successes;
+        if (typeof bs.fatal_flag === "boolean" && bs.fatal_flag) slot.status = slot.status || "failed";
+      }
+
+      models[modelName] = slot;
+      benchEntry.models = models;
+      benches[benchName] = benchEntry;
+      return {
+        ...base,
+        benches,
+        // 也实时刷新 顶层 status / updated_at，让 SSE 断线兜底的 polling 看到 latest
+        updated_at: new Date().toISOString(),
+      };
+    };
+
+    es.addEventListener("snapshot", (ev: MessageEvent) => {
+      if (cancelled) return;
+      try {
+        const data = JSON.parse(ev.data);
+        if (Array.isArray(data.eval_progress)) {
+          setEvalProgress(data.eval_progress);
+        } else if (data.eval_progress) {
+          setEvalProgress([data.eval_progress]);
+        }
+        if (data.workflow_meta) setWorkflowMeta(data.workflow_meta);
+        setSseAlive(true);
+      } catch (e) {
+        console.error("SSE snapshot parse error", e);
+      }
+    });
+
+    es.addEventListener("progress", (ev: MessageEvent) => {
+      if (cancelled) return;
+      try {
+        const payload = JSON.parse(ev.data);
+        setEvalProgress((prev) => mergeProgress(prev, payload));
+        setWorkflowMeta((prev: any) => mergeMeta(prev, payload));
+      } catch (e) {
+        console.error("SSE progress parse error", e);
+      }
+    });
+
+    es.addEventListener("end", () => {
+      if (cancelled) return;
+      es.close();
+      setSseAlive(false);
+    });
+
+    es.onerror = () => {
+      if (cancelled) return;
+      // SSE 不可达或断开。关闭流并把 sseAlive 复位 → polling useEffect 接管。
+      es.close();
+      setSseAlive(false);
+    };
+
+    return () => {
+      cancelled = true;
+      es.close();
+      setSseAlive(false);
+    };
+  }, [threadId, status, apiBaseUrl]);
+
   // Polling
   useEffect(() => {
     if (!threadId || status === "completed" || status === "failed" || status === "stopped" || isResuming) return;
+    // SSE 主推时跳过轮询；SSE 断了 sseAlive 会变回 false，轮询自动恢复。
+    if (sseAlive) return;
 
     const interval = setInterval(async () => {
       try {
@@ -499,6 +633,9 @@ export const Eval = () => {
 
         setStatus(data.status);
         setEvalProgress(Array.isArray(data.eval_progress) ? data.eval_progress : (data.eval_progress ? [data.eval_progress] : []));
+        if ((data as any).workflow_meta) {
+          setWorkflowMeta((data as any).workflow_meta);
+        }
         if (data.status === "interrupted") {
             const interruptValue = data.interrupts?.[0]?.value;
             const token = `${threadId || ""}|${data.next_node?.[0] || ""}|${JSON.stringify(interruptValue ?? "")}`;
@@ -550,7 +687,7 @@ export const Eval = () => {
     }, 1500); 
 
     return () => clearInterval(interval);
-  }, [threadId, status, isResuming, t]);
+  }, [threadId, status, isResuming, t, sseAlive]);
 
   // Handle preSelectedBench from Gallery page navigation
   useEffect(() => {
@@ -1097,6 +1234,45 @@ export const Eval = () => {
       setStatus("running");
       setMessages(prev => [...prev, { id: Date.now().toString(), role: "ai", content: t({ zh: "已重新进入执行阶段，请确认配置后开始评测。", en: "Re-running execution. Please confirm configuration to start evaluation." }), timestamp: Date.now() }]);
   };
+
+  const handleRetryModel = useCallback(async (benchName: string, modelName: string) => {
+      // 只重跑 (bench, model)：DataFlowEvalNode 进入后会发现仅这一个 model 还是 pending，
+      // 其他已成功的 model 不再触发，缓存的 LLM serving 也直接复用。
+      if (!threadId) return;
+      try {
+          await axios.post(`${apiBaseUrl}/api/workflow/rerun_model/${threadId}`, {
+              bench_name: benchName,
+              model_name: modelName,
+          });
+          setStatus("running");
+          setMessages(prev => [
+              ...prev,
+              {
+                  id: Date.now().toString(),
+                  role: "ai",
+                  content: t({
+                      zh: `正在重跑 ${benchName} / ${modelName} ...`,
+                      en: `Re-running ${benchName} / ${modelName} ...`,
+                  }),
+                  timestamp: Date.now(),
+              },
+          ]);
+      } catch (e: any) {
+          const detail = e?.response?.data?.detail || String(e);
+          setMessages(prev => [
+              ...prev,
+              {
+                  id: Date.now().toString(),
+                  role: "system",
+                  content: t({
+                      zh: `重跑失败：${detail}`,
+                      en: `Retry failed: ${detail}`,
+                  }),
+                  timestamp: Date.now(),
+              },
+          ]);
+      }
+  }, [threadId, apiBaseUrl, t]);
 
   const handleManualStart = async () => {
       // Check if we have models to evaluate
@@ -2987,6 +3163,9 @@ export const Eval = () => {
                 onViewJudgeResult={() => setShowJudgeResultModal(true)}
                 isFullscreen={summaryFullscreen}
                 onFullscreenChange={setSummaryFullscreen}
+                workflowMeta={workflowMeta}
+                sseAlive={sseAlive}
+                onRetryModel={handleRetryModel}
                 onPreviewModel={(bench, model) => {
                     setPreviewCtx({ bench, model });
                     setPreviewOpen(true);

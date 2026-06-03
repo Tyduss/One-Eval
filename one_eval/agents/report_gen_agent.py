@@ -111,6 +111,7 @@ class ReportGenAgent(CustomAgent):
         else:
             bench_summaries = self._build_bench_summaries(benches, eval_results, metric_plan)
             overall_score = self._compute_overall_score(bench_summaries)
+            failed_models = self._collect_failed_models(benches)
 
             lang = self._get_lang(state)
             macro_view = self._build_macro_view(bench_summaries, eval_results, lang)
@@ -134,6 +135,7 @@ class ReportGenAgent(CustomAgent):
                 "overall": {
                     "score": overall_score,
                     "bench_summaries": bench_summaries,
+                    "failed_models": failed_models,
                 },
                 "macro": macro_view,
                 "diagnostic": {
@@ -160,26 +162,61 @@ class ReportGenAgent(CustomAgent):
 
         return state
 
+    def _collect_failed_models(self, benches: List[BenchInfo]) -> List[Dict[str, Any]]:
+        """聚合 per-bench × per-model 的 failed / cancelled 状态供前端显式展示。"""
+        failed: List[Dict[str, Any]] = []
+        for bench in benches:
+            bench_name = bench.bench_name
+            eval_results_meta = (bench.meta or {}).get("eval_results", {}) or {}
+            for m_name, m_result in eval_results_meta.items():
+                status = (m_result or {}).get("status")
+                if status in ("failed", "cancelled"):
+                    failed.append({
+                        "bench": bench_name,
+                        "model": m_name,
+                        "status": status,
+                        "error": (m_result or {}).get("error"),
+                        "consecutive_failures": (m_result or {}).get("consecutive_failures"),
+                        "max_failures": (m_result or {}).get("max_failures"),
+                    })
+        return failed
+
     def _build_generation_only_report(self, state: NodeState, benches: List[BenchInfo]) -> Dict[str, Any]:
-        """为无参考答案的纯生成模式构建报告"""
+        """为无参考答案的纯生成模式构建报告。区分 success/failed/cancelled：
+        success → bench_summaries 带 detail_path；failed/cancelled → failed_models 列表，
+        不写 detail_path（避免前端拿到全空响应的脏文件）。
+        """
         model_name = self._get_model_name(state)
         bench_summaries = []
+        failed_models: List[Dict[str, Any]] = []
 
         for bench in benches:
             meta = bench.meta or {}
             eval_results_meta = meta.get("eval_results", {})
 
             for m_name, m_result in eval_results_meta.items():
-                bench_summaries.append({
-                    "bench": bench.bench_name,
-                    "model": m_name,
-                    "eval_type": bench.bench_dataflow_eval_type or "unknown",
-                    "primary_metric": None,
-                    "primary_score": None,
-                    "detail_path": m_result.get("detail_path"),
-                })
+                status = (m_result or {}).get("status") or "success"
+                if status == "success":
+                    bench_summaries.append({
+                        "bench": bench.bench_name,
+                        "model": m_name,
+                        "eval_type": bench.bench_dataflow_eval_type or "unknown",
+                        "primary_metric": None,
+                        "primary_score": None,
+                        "detail_path": m_result.get("detail_path"),
+                    })
+                else:
+                    failed_models.append({
+                        "bench": bench.bench_name,
+                        "model": m_name,
+                        "status": status,
+                        "error": (m_result or {}).get("error"),
+                        "consecutive_failures": (m_result or {}).get("consecutive_failures"),
+                        "max_failures": (m_result or {}).get("max_failures"),
+                    })
 
             if not eval_results_meta and meta.get("eval_detail_path"):
+                # Single-model legacy 入口：保持原行为
                 bench_summaries.append({
                     "bench": bench.bench_name,
                     "model": model_name,
@@ -190,11 +227,27 @@ class ReportGenAgent(CustomAgent):
                 })
 
         lang = self._get_lang(state)
-        summary_text = (
-            f"模型 {model_name} 在 {len(benches)} 个评测集上完成了生成任务（无参考答案模式）。"
-            if not str(lang).lower().startswith("en")
-            else f"Model {model_name} completed generation tasks on {len(benches)} benchmark(s) (no-reference mode)."
-        )
+        # Summary text reflects partial-success / all-failed situations honestly.
+        success_count = len(bench_summaries)
+        failed_count = len(failed_models)
+        if failed_count > 0 and success_count > 0:
+            summary_text = (
+                f"模型在 {len(benches)} 个评测集上部分成功：{success_count} 个完成，{failed_count} 个失败/取消。失败明细见 failed_models 字段。"
+                if not str(lang).lower().startswith("en")
+                else f"Partial success: {success_count} succeeded, {failed_count} failed/cancelled. See failed_models."
+            )
+        elif failed_count > 0 and success_count == 0:
+            summary_text = (
+                f"全部 {failed_count} 个评测均失败/取消，请检查 API key / 网络 / 模型配置后重试。"
+                if not str(lang).lower().startswith("en")
+                else f"All {failed_count} run(s) failed/cancelled. Check API key / network / model config."
+            )
+        else:
+            summary_text = (
+                f"模型 {model_name} 在 {len(benches)} 个评测集上完成了生成任务（无参考答案模式）。"
+                if not str(lang).lower().startswith("en")
+                else f"Model {model_name} completed generation tasks on {len(benches)} benchmark(s) (no-reference mode)."
+            )
 
         return {
             "version": "v1",
@@ -204,6 +257,7 @@ class ReportGenAgent(CustomAgent):
             "overall": {
                 "score": None,
                 "bench_summaries": bench_summaries,
+                "failed_models": failed_models,
             },
             "macro": {"radar": {"labels": [], "scores": []}, "sunburst": {"rows": []}, "table": []},
             "diagnostic": {"error_distribution": [], "length_histogram": {"bins": [0], "correct": [0], "incorrect": [0]}},
@@ -230,9 +284,13 @@ class ReportGenAgent(CustomAgent):
         summaries = []
         for bench in benches:
             bench_name = bench.bench_name
+            # 跳过 partial / failed bench：它们的指标本来就缺；report 只展示成功完成的。
+            if getattr(bench, "eval_status", None) in ("failed", "partial"):
+                continue
+
             bench_result = eval_results.get(bench_name) or {}
             metrics = bench_result.get("metrics", {}) or {}
-            
+
             # --- MODIFIED: Use 'accuracy' from meta.eval_result as primary score ---
             raw_bench_score = ((bench.meta or {}).get("eval_result") or {}).get("accuracy")
             if raw_bench_score is None:
@@ -241,7 +299,7 @@ class ReportGenAgent(CustomAgent):
 
             has_bench_score = raw_bench_score is not None
             bench_score = self._safe_float(raw_bench_score)
-            
+
             # Keep original primary name logic just for display name, but score comes from meta
             plan = metric_plan.get(bench_name, []) or []
             primary_name = self._get_primary_metric_name(plan, metrics)

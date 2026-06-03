@@ -2,15 +2,56 @@ from __future__ import annotations
 
 import asyncio
 import os
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional, List
+from typing import Any, Dict, Optional, List
 
 from one_eval.core.node import BaseNode
 from one_eval.core.state import NodeState, ModelConfig
-from one_eval.toolkits.dataflow_eval_tool import DataFlowEvalTool
+from one_eval.toolkits.dataflow_eval_tool import (
+    AuthError,
+    BatchFatalError,
+    CancelledByUserError,
+    DataFlowEvalTool,
+    _APILLMServingWithTimeout,
+)
 from one_eval.logger import get_logger
 from langgraph.types import Command
 from one_eval.runtime.progress_store import set_progress, clear_progress
+from one_eval.runtime.task_registry import (
+    EvalTaskContext,
+    register_task,
+    unregister_task,
+    record_model_status,
+)
+from one_eval.runtime import workflow_meta_store
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _read_batch_counters(tool: DataFlowEvalTool) -> tuple:
+    """Best-effort read consecutive_failures / max_failures from the most recent
+    _APILLMServingWithTimeout the tool used. Returns (cf, mf) or (None, None) if
+    no serving / not an API serving.
+    """
+    try:
+        cache = getattr(tool, "_cached_llm_servings", {}) or {}
+        for cached in cache.values():
+            if isinstance(cached, _APILLMServingWithTimeout):
+                snap = cached._batch_status.snapshot()
+                if snap.get("failures", 0) > 0 or snap.get("fatal_flag"):
+                    return snap.get("consecutive_failures"), snap.get("max_failures")
+        # Fall through: return first serving's snapshot if any.
+        for cached in cache.values():
+            if isinstance(cached, _APILLMServingWithTimeout):
+                snap = cached._batch_status.snapshot()
+                return snap.get("consecutive_failures"), snap.get("max_failures")
+    except Exception:
+        pass
+    return None, None
+
 
 log = get_logger("DataFlowEvalNode")
 VALID_EVAL_TYPES = {
@@ -71,6 +112,26 @@ class DataFlowEvalNode(BaseNode):
         except Exception:
             thread_id = None
 
+        ctx: Optional[EvalTaskContext] = None
+        if thread_id:
+            ctx = register_task(thread_id)
+            workflow_meta_store.init_thread(thread_id)
+
+        try:
+            return await self._run_inner(state, config, thread_id, ctx)
+        finally:
+            if thread_id:
+                clear_progress(thread_id)
+                unregister_task(thread_id)
+
+    async def _run_inner(
+        self,
+        state: NodeState,
+        config: Optional[Any],
+        thread_id: Optional[str],
+        ctx: Optional[EvalTaskContext],
+    ) -> NodeState:
+
         benches = getattr(state, "benches", None)
         if not benches:
             self.logger.warning("[DataFlowEvalNode] state.benches 为空")
@@ -95,22 +156,33 @@ class DataFlowEvalNode(BaseNode):
 
         bench = benches[cursor]
 
-        # 检查是否已完成所有模型的评测
-        if bench.eval_status == "success" and bench.meta:
+        # 检查 bench 是否已完成所有模型的评测（success / partial 都视为有历史结果）。
+        # Prior success slots 在 partial 重跑时必须保留：rerun_model API 把目标 model 改回 pending，
+        # 这里只挑 status != success 的 model 来跑，避免覆盖已经成功的代价。
+        if bench.eval_status in ("success", "partial") and bench.meta:
             existing_results = bench.meta.get("eval_results", {})
-            if is_multi_model:
-                # 多模型模式下检查是否所有模型都已完成
-                all_done = all(m.model_name_or_path in existing_results for m in model_configs)
-                if all_done:
-                    self.logger.info(f"[{bench.bench_name}] 所有模型已评测完成，跳过")
-                    state.eval_cursor = cursor + 1
-                    return state
-            else:
-                # 单模型模式
-                if bench.meta.get("eval_result"):
-                    self.logger.info(f"[{bench.bench_name}] 已评测成功，跳过")
-                    state.eval_cursor = cursor + 1
-                    return state
+            pending_models = [
+                m for m in model_configs
+                if existing_results.get(m.model_name_or_path, {}).get("status") != "success"
+            ]
+            if not pending_models:
+                self.logger.info(f"[{bench.bench_name}] 所有模型已成功（partial 复用时也命中），跳过")
+                state.eval_cursor = cursor + 1
+                return state
+            # 部分 model 还需要跑：使用 pending_models 替换本轮的 model_configs。
+            # 这样 rerun_model / partial-resume 都能仅重跑失败/取消/未跑的。
+            model_configs = pending_models
+            is_multi_model = len(model_configs) > 1
+            self.logger.info(
+                f"[{bench.bench_name}] 已跳过已成功 model，仅重跑: "
+                f"{[m.model_name_or_path for m in model_configs]}"
+            )
+        elif bench.eval_status == "success" and not is_multi_model:
+            # 单模型模式：过去直接走 eval_result 兜底
+            if bench.meta.get("eval_result"):
+                self.logger.info(f"[{bench.bench_name}] 已评测成功，跳过")
+                state.eval_cursor = cursor + 1
+                return state
 
         if not bench.dataset_cache:
             self.logger.warning(f"[{bench.bench_name}] 缺少 dataset_cache，跳过")
@@ -171,67 +243,198 @@ class DataFlowEvalNode(BaseNode):
         # 并行执行多模型评测
         if is_multi_model:
             results = await self._run_multi_model_eval(
-                bench, model_configs, tool, thread_id
+                bench, model_configs, tool, thread_id, ctx
             )
         else:
             # 单模型直接执行
             results = await self._run_single_model_eval(
-                bench, model_configs[0], tool, thread_id
+                bench, model_configs[0], tool, thread_id, ctx
             )
 
-        # 处理结果
-        all_success = True
+        # === 处理结果（区分 success / failed / cancelled，写 per-model schema） ===
+        success_models: list = []
+        failed_models: list = []
+        cancelled_models: list = []
+        first_success_key_mapping: Optional[dict] = None
+
         for model_name, result in results.items():
+            slot = bench.meta["eval_results"].setdefault(model_name, {})
             if result.get("success"):
-                if is_multi_model:
-                    bench.meta["eval_results"][model_name] = {
-                        "stats": result["stats"],
-                        "detail_path": result["detail_path"],
-                    }
-                else:
-                    bench.meta["eval_result"] = result["stats"]
-                    bench.meta["eval_detail_path"] = result["detail_path"]
+                success_models.append(model_name)
+                slot.update({
+                    "status": "success",
+                    "stats": result.get("stats", {}),
+                    "detail_path": result.get("detail_path"),
+                    "finished_at": _now_iso(),
+                })
+                slot.pop("error", None)
+                if first_success_key_mapping is None:
+                    first_success_key_mapping = result.get("key_mapping", {})
+                # Keep legacy single-model fields populated for backward compatibility.
+                if not is_multi_model:
+                    bench.meta["eval_result"] = result.get("stats", {})
+                    bench.meta["eval_detail_path"] = result.get("detail_path")
+            elif result.get("cancelled"):
+                cancelled_models.append(model_name)
+                slot.update({
+                    "status": "cancelled",
+                    "error": result.get("error", "cancelled"),
+                    "finished_at": _now_iso(),
+                })
+                # Failure detail (counter + reason) so the UI can show "failures=3/3".
+                if result.get("consecutive_failures") is not None:
+                    slot["consecutive_failures"] = result["consecutive_failures"]
+                if result.get("max_failures") is not None:
+                    slot["max_failures"] = result["max_failures"]
+                self.logger.warning(f"[{bench.bench_name}] 模型 {model_name} 被取消: {result.get('error')}")
             else:
-                all_success = False
+                failed_models.append(model_name)
+                slot.update({
+                    "status": "failed",
+                    "error": result.get("error", "unknown error"),
+                    "finished_at": _now_iso(),
+                })
+                # Persist per-batch failure stats for downstream display / rerun hint.
+                if result.get("consecutive_failures") is not None:
+                    slot["consecutive_failures"] = result["consecutive_failures"]
+                if result.get("max_failures") is not None:
+                    slot["max_failures"] = result["max_failures"]
                 self.logger.error(f"[{bench.bench_name}] 模型 {model_name} 评测失败: {result.get('error')}")
 
-        if all_success:
+            record_model_status(
+                thread_id,
+                bench.bench_name,
+                model_name,
+                slot["status"],
+                error=slot.get("error"),
+            ) if thread_id else None
+
+        # Derive bench-level status: all-success → success; any non-success → failed (partial = some success + some failed).
+        if success_models and not failed_models and not cancelled_models:
             bench.eval_status = "success"
-            # 使用第一个模型的结果进行 key mapping 设置
-            first_result = list(results.values())[0]
-            if first_result.get("success"):
-                self._set_key_mapping(bench, first_result.get("key_mapping", {}))
+            if first_success_key_mapping is not None:
+                self._set_key_mapping(bench, first_success_key_mapping)
+            bench.meta.pop("eval_error", None)
+            bench.meta.pop("eval_per_model_errors", None)
             self.logger.info(f"[{bench.bench_name}] 评测完成")
+        elif success_models and (failed_models or cancelled_models):
+            # Partial success: emit precise per-model errors so the UI / report can show them.
+            bench.eval_status = "partial"
+            if first_success_key_mapping is not None:
+                self._set_key_mapping(bench, first_success_key_mapping)
+            bench.meta["eval_per_model_errors"] = {
+                m: bench.meta["eval_results"].get(m, {}).get("error", "")
+                for m in (failed_models + cancelled_models)
+            }
+            bench.meta["eval_error"] = "; ".join(
+                f"{m}: {(bench.meta['eval_results'].get(m, {}).get('error') or 'unknown')[:120]}"
+                for m in (failed_models + cancelled_models)
+            )
         else:
             bench.eval_status = "failed"
-            bench.meta["eval_error"] = "部分模型评测失败"
+            bench.meta["eval_per_model_errors"] = {
+                m: bench.meta["eval_results"].get(m, {}).get("error", "")
+                for m in (failed_models + cancelled_models)
+            }
+            bench.meta["eval_error"] = "; ".join(
+                f"{m}: {(bench.meta['eval_results'].get(m, {}).get('error') or 'unknown')[:120]}"
+                for m in (failed_models + cancelled_models)
+            )
 
         state.eval_cursor = cursor + 1
-        if thread_id and state.eval_cursor >= len(benches):
-            clear_progress(thread_id)
         return state
 
     async def _run_single_model_eval(
-        self, bench, model_config: ModelConfig, tool, thread_id: Optional[str]
+        self,
+        bench,
+        model_config: ModelConfig,
+        tool,
+        thread_id: Optional[str],
+        ctx: Optional[EvalTaskContext] = None,
     ) -> dict:
         """执行单模型评测"""
         model_name = model_config.model_name_or_path
+
+        # 初始化 per-model 状态条目
+        bench.meta.setdefault("eval_results", {})[model_name] = {
+            "status": "running",
+            "started_at": _now_iso(),
+        }
+        if thread_id:
+            record_model_status(thread_id, bench.bench_name, model_name, "running")
 
         def _on_progress(p: dict):
             if not bench.meta:
                 bench.meta = {}
             bench.meta["eval_progress"] = p
             if thread_id:
-                set_progress(thread_id, p)
+                # Strip the heavy batch_status dict before stuffing into set_progress
+                # (wealready mirror it into workflow_meta_store below).
+                p_for_store = {k: v for k, v in p.items() if k != "batch_status"}
+                set_progress(thread_id, p_for_store)
+                meta_payload: dict = {
+                    "stage": p.get("stage"),
+                    "generated": p.get("generated"),
+                    "total": p.get("total"),
+                    "percent": p.get("percent"),
+                }
+                # Forward per-prompt failure counter to the workflow_meta model entry.
+                bs = p.get("batch_status")
+                if isinstance(bs, dict):
+                    meta_payload["consecutive_failures"] = bs.get("consecutive_failures", 0)
+                    meta_payload["max_failures"] = bs.get("max_failures", 3)
+                    meta_payload["failures"] = bs.get("failures", 0)
+                    meta_payload["successes"] = bs.get("successes", 0)
+                    if bs.get("last_error"):
+                        meta_payload["last_error"] = bs["last_error"]
+                workflow_meta_store.update_model(
+                    thread_id,
+                    bench.bench_name,
+                    model_name,
+                    meta_payload,
+                )
+
+        def _emit_final_failure(
+            stage: str,
+            error: str,
+            status: str = "failed",
+            cf: Optional[int] = None,
+            mf: Optional[int] = None,
+        ):
+            """Send a final progress event so SSE frontend can move this model
+            out of 'running' display."""
+            if not thread_id:
+                return
+            payload: Dict[str, Any] = {
+                "bench_name": bench.bench_name,
+                "model_name": model_name,
+                "stage": stage,
+                "status": status,
+                "error": error,
+                "percent": 100.0,
+            }
+            if cf is not None:
+                payload["consecutive_failures"] = cf
+            if mf is not None:
+                payload["max_failures"] = mf
+            set_progress(thread_id, payload)
 
         try:
             self.logger.info(f"[{bench.bench_name}] 开始评测模型: {model_name}")
-            result = tool.run_eval(bench, model_config, progress_callback=_on_progress)
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: tool.run_eval(
+                    bench, model_config, progress_callback=_on_progress, task_ctx=ctx
+                ),
+            )
 
             if thread_id:
                 set_progress(thread_id, {
                     "bench_name": bench.bench_name,
+                    "model_name": model_name,
                     "stage": "done",
+                    "status": "success",
                     "generated": int((bench.meta.get("eval_progress") or {}).get("generated") or 0),
                     "total": int((bench.meta.get("eval_progress") or {}).get("total") or 0),
                     "percent": 100.0,
@@ -243,12 +446,32 @@ class DataFlowEvalNode(BaseNode):
                 "detail_path": result["detail_path"],
                 "key_mapping": result.get("key_mapping", {}),
             }}
+        except AuthError as e:
+            self.logger.error(f"[{bench.bench_name}] 模型 {model_name} 认证失败: {e}")
+            _emit_final_failure("done", str(e), status="failed", cf=1)
+            return {model_name: {"success": False, "error": str(e), "consecutive_failures": 1}}
+        except BatchFatalError as e:
+            self.logger.error(f"[{bench.bench_name}] 模型 {model_name} 批次失败中止: {e}")
+            cf, mf = _read_batch_counters(tool)
+            _emit_final_failure("done", str(e), status="failed", cf=cf, mf=mf)
+            return {model_name: {"success": False, "error": str(e), "consecutive_failures": cf, "max_failures": mf}}
+        except CancelledByUserError as e:
+            self.logger.warning(f"[{bench.bench_name}] 模型 {model_name} 被取消: {e}")
+            cf, mf = _read_batch_counters(tool)
+            _emit_final_failure("done", str(e), status="cancelled", cf=cf, mf=mf)
+            return {model_name: {"success": False, "cancelled": True, "error": str(e), "consecutive_failures": cf, "max_failures": mf}}
         except Exception as e:
             self.logger.error(f"[{bench.bench_name}] 模型 {model_name} 评测失败: {e}")
+            _emit_final_failure("done", str(e), status="failed")
             return {model_name: {"success": False, "error": str(e)}}
 
     async def _run_multi_model_eval(
-        self, bench, model_configs: List[ModelConfig], tool, thread_id: Optional[str]
+        self,
+        bench,
+        model_configs: List[ModelConfig],
+        tool,
+        thread_id: Optional[str],
+        ctx: Optional[EvalTaskContext] = None,
     ) -> dict:
         """并行执行多模型评测"""
         self.logger.info(f"[{bench.bench_name}] 并行评测 {len(model_configs)} 个模型")
@@ -257,22 +480,76 @@ class DataFlowEvalNode(BaseNode):
             """单个模型评测的异步任务"""
             model_name = model_config.model_name_or_path
 
+            # 初始化 per-model 状态条目（在并发场景里同样必要）
+            bench.meta.setdefault("eval_results", {})[model_name] = {
+                "status": "running",
+                "started_at": _now_iso(),
+            }
+            if thread_id:
+                record_model_status(thread_id, bench.bench_name, model_name, "running")
+
             def _on_progress(p: dict):
                 # 每个模型独立更新进度，用 {thread_id}:{model_name} 做 key
                 if thread_id:
-                    p_with_model = {**p, "model_name": model_name}
+                    p_for_store = {k: v for k, v in p.items() if k != "batch_status"}
+                    p_with_model = {**p_for_store, "model_name": model_name}
                     set_progress(f"{thread_id}:{model_name}", p_with_model)
+                    meta_payload: dict = {
+                        "stage": p.get("stage"),
+                        "generated": p.get("generated"),
+                        "total": p.get("total"),
+                        "percent": p.get("percent"),
+                    }
+                    bs = p.get("batch_status")
+                    if isinstance(bs, dict):
+                        meta_payload["consecutive_failures"] = bs.get("consecutive_failures", 0)
+                        meta_payload["max_failures"] = bs.get("max_failures", 3)
+                        meta_payload["failures"] = bs.get("failures", 0)
+                        meta_payload["successes"] = bs.get("successes", 0)
+                        if bs.get("last_error"):
+                            meta_payload["last_error"] = bs["last_error"]
+                    workflow_meta_store.update_model(
+                        thread_id,
+                        bench.bench_name,
+                        model_name,
+                        meta_payload,
+                    )
                 # 同时更新 bench.meta 供前端 state 同步
                 if not bench.meta:
                     bench.meta = {}
                 bench.meta["eval_progress"] = p
+
+            def _emit_final_failure(
+                stage: str,
+                error: str,
+                status: str = "failed",
+                cf: Optional[int] = None,
+                mf: Optional[int] = None,
+            ):
+                if not thread_id:
+                    return
+                payload: Dict[str, Any] = {
+                    "bench_name": bench.bench_name,
+                    "model_name": model_name,
+                    "stage": stage,
+                    "status": status,
+                    "error": error,
+                    "percent": 100.0,
+                }
+                if cf is not None:
+                    payload["consecutive_failures"] = cf
+                if mf is not None:
+                    payload["max_failures"] = mf
+                set_progress(f"{thread_id}:{model_name}", payload)
 
             try:
                 # 在线程池中运行同步的评测方法
                 loop = asyncio.get_event_loop()
                 result = await loop.run_in_executor(
                     None,
-                    lambda: tool.run_eval(bench, model_config, progress_callback=_on_progress)
+                    lambda: tool.run_eval(
+                        bench, model_config, progress_callback=_on_progress, task_ctx=ctx
+                    ),
                 )
 
                 # 更新完成的模型列表
@@ -286,6 +563,7 @@ class DataFlowEvalNode(BaseNode):
                         "bench_name": bench.bench_name,
                         "model_name": model_name,
                         "stage": "done",
+                        "status": "success",
                         "generated": int((bench.meta.get("eval_progress") or {}).get("generated") or 0),
                         "total": int((bench.meta.get("eval_progress") or {}).get("total") or 0),
                         "percent": 100.0,
@@ -297,8 +575,23 @@ class DataFlowEvalNode(BaseNode):
                     "detail_path": result["detail_path"],
                     "key_mapping": result.get("key_mapping", {}),
                 }
+            except AuthError as e:
+                self.logger.error(f"[{bench.bench_name}] 模型 {model_name} 认证失败: {e}")
+                _emit_final_failure("done", str(e), status="failed", cf=1)
+                return model_name, {"success": False, "error": str(e), "consecutive_failures": 1}
+            except BatchFatalError as e:
+                self.logger.error(f"[{bench.bench_name}] 模型 {model_name} 批次失败中止: {e}")
+                cf, mf = _read_batch_counters(tool)
+                _emit_final_failure("done", str(e), status="failed", cf=cf, mf=mf)
+                return model_name, {"success": False, "error": str(e), "consecutive_failures": cf, "max_failures": mf}
+            except CancelledByUserError as e:
+                self.logger.warning(f"[{bench.bench_name}] 模型 {model_name} 被取消: {e}")
+                cf, mf = _read_batch_counters(tool)
+                _emit_final_failure("done", str(e), status="cancelled", cf=cf, mf=mf)
+                return model_name, {"success": False, "cancelled": True, "error": str(e), "consecutive_failures": cf, "max_failures": mf}
             except Exception as e:
                 self.logger.error(f"[{bench.bench_name}] 模型 {model_name} 评测失败: {e}")
+                _emit_final_failure("done", str(e), status="failed")
                 return model_name, {"success": False, "error": str(e)}
 
         # 并行执行所有模型评测

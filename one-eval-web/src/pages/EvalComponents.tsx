@@ -1,11 +1,11 @@
-import React, { useRef, useEffect, useState } from "react";
+import React, { useRef, useEffect, useState, Component, type ErrorInfo, type ReactNode } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import JudgeConfigPanel from "@/components/judge/JudgeConfigPanel";
 import JudgeProgressPanel from "@/components/judge/JudgeProgressPanel";
 import {
     Send, Check, Loader2, AlertCircle, ChevronDown, ChevronUp,
     Database, Bot, Maximize2, Minimize2, X, Save as SaveIcon, Tag, Upload,
-    ClipboardCheck, BarChart3, History, Eye, Download
+    ClipboardCheck, BarChart3, History, Eye, Download, RotateCw
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -35,6 +35,120 @@ export interface WorkflowState {
   metric_plan?: Record<string, any[]>;
   reports?: Record<string, any>;
 }
+
+// per-bench × per-model 持久化镜像（由 workflow_meta_store 写入，
+// SSE snapshot/get_status 返回）。失败模型也会在里面，方便前端展示
+// 红色 badge + 重试按钮。
+export interface WorkflowMetaModel {
+  status?: "pending" | "running" | "success" | "failed" | "cancelled";
+  stage?: string;
+  generated?: number;
+  total?: number;
+  percent?: number;
+  error?: string | null;
+  started_at?: string;
+  finished_at?: string;
+  // 批次级失败计数（_BatchStatus 实时投影）。
+  consecutive_failures?: number;
+  max_failures?: number;
+  failures?: number;
+  successes?: number;
+  last_error?: string | null;
+}
+export interface WorkflowMetaBench {
+  models?: Record<string, WorkflowMetaModel>;
+}
+export interface WorkflowMetaSnapshot {
+  thread_id?: string;
+  status?: string;
+  started_at?: string;
+  updated_at?: string;
+  cancel_reason?: string | null;
+  benches?: Record<string, WorkflowMetaBench>;
+}
+
+// Defensive boundary so a broken bench / model entry can't crash an entire tab.
+// （Plan §C.3：Tab 2 白屏的兜底防御。）
+interface TabErrorBoundaryState { hasError: boolean; message?: string }
+export class TabErrorBoundary extends Component<{ children: ReactNode; fallbackLabel?: string }, TabErrorBoundaryState> {
+    state: TabErrorBoundaryState = { hasError: false };
+    static getDerivedStateFromError(err: Error): TabErrorBoundaryState {
+        return { hasError: true, message: err?.message || "render error" };
+    }
+    componentDidCatch(error: Error, info: ErrorInfo) {
+        // eslint-disable-next-line no-console
+        console.error("[TabErrorBoundary]", error, info?.componentStack);
+    }
+    render() {
+        if (this.state.hasError) {
+            return (
+                <div className="flex flex-col items-center justify-center py-12 text-slate-400 gap-2">
+                    <AlertCircle className="w-8 h-8 text-amber-400" />
+                    <p className="text-sm">{this.props.fallbackLabel || "该面板出错，请刷新或切换其他 Tab"}</p>
+                    {this.state.message && (
+                        <p className="text-[10px] text-slate-300 font-mono">{this.state.message}</p>
+                    )}
+                </div>
+            );
+        }
+        return this.props.children;
+    }
+}
+
+// Per-model status pill. Used in SummaryBenchCard table headers and Tab 2 entries.
+export const ModelStatusBadge = ({ status, lang }: { status?: string; lang: Lang }) => {
+    const tt = (zh: string, en: string) => (lang === "zh" ? zh : en);
+    if (!status) return null;
+    const cfg: Record<string, { cls: string; label: string }> = {
+        running: { cls: "bg-blue-50 text-blue-600 border-blue-100", label: tt("运行中", "Running") },
+        success: { cls: "bg-emerald-50 text-emerald-700 border-emerald-100", label: tt("成功", "Success") },
+        failed: { cls: "bg-red-50 text-red-700 border-red-100", label: tt("失败", "Failed") },
+        cancelled: { cls: "bg-amber-50 text-amber-700 border-amber-100", label: tt("已取消", "Cancelled") },
+        pending: { cls: "bg-slate-50 text-slate-500 border-slate-100", label: tt("待运行", "Pending") },
+    };
+    const it = cfg[status] || { cls: "bg-slate-50 text-slate-500 border-slate-100", label: status };
+    return (
+        <span className={cn("text-[9px] font-bold px-1.5 py-0.5 rounded border whitespace-nowrap", it.cls)}>
+            {it.label}
+        </span>
+    );
+};
+
+// Indicate consecutive failure counter for a running model. Shows "失败 N/M" or
+// "fail N/M" with tooltip on last error. When N=0 and last_error is null, returns null.
+export const FailureCounterBadge = ({
+    consecutive,
+    max,
+    lastError,
+    lang,
+}: {
+    consecutive?: number;
+    max?: number;
+    lastError?: string | null;
+    lang: Lang;
+}) => {
+    const tt = (zh: string, en: string) => (lang === "zh" ? zh : en);
+    if (consecutive === undefined || consecutive === null) return null;
+    if (consecutive <= 0 && !lastError) return null;
+    const m = max || 3;
+    const ratio = consecutive / m;
+    // color escalates from amber → red as ratio approaches 1.
+    const cls =
+        ratio >= 1
+            ? "bg-red-100 text-red-700 border-red-200"
+            : ratio >= 0.5
+                ? "bg-amber-50 text-amber-700 border-amber-200"
+                : "bg-slate-50 text-slate-500 border-slate-200";
+    const label = `${tt("失败", "fail")} ${consecutive}/${m}`;
+    return (
+        <span
+            className={cn("text-[9px] font-mono px-1.5 py-0.5 rounded border whitespace-nowrap", cls)}
+            title={lastError || undefined}
+        >
+            {label}
+        </span>
+    );
+};
 
 // --- Modal Component ---
 const Modal = ({ isOpen, onClose, title, description, children, footer }: { isOpen: boolean, onClose: () => void, title: React.ReactNode, description?: string, children: React.ReactNode, footer?: React.ReactNode }) => {
@@ -729,7 +843,9 @@ interface ChatPanelProps {
         total?: number;
         percent?: number;
         model?: string;
+        model_name?: string;
         current?: number;
+        status?: string;
     }> | null;
 }
 
@@ -793,14 +909,19 @@ const getNodeStage = (nodeName: string | null | undefined, lang: string = "zh"):
 };
 
 // 从进度数组中获取主要进度信息
+// multi-model 场景：SSE 会推送 N 条带 model_name 的 progress。
+// 我们聚合所有 entries：terminal(failed/cancelled)=100%、running=its percent、unknown=0。
+// 取平均 percent 作为整体进度，避免任何一个 model 卡在 0% 让前端永远显示 0。
 const getPrimaryProgress = (evalProgress?: Array<{
     bench_name?: string;
     stage?: string;
     generated?: number;
     total?: number;
     percent?: number;
+    model_name?: string;
     model?: string;
     current?: number;
+    status?: string;
 }> | null): {
     percent?: number;
     bench_name?: string;
@@ -809,19 +930,42 @@ const getPrimaryProgress = (evalProgress?: Array<{
     total?: number;
     model?: string;
     current?: number;
+    status?: string;
 } | null => {
     if (!evalProgress || !Array.isArray(evalProgress) || evalProgress.length === 0) {
         return null;
     }
 
-    // 如果有进度百分比，使用第一个有百分比的项目
-    const withPercent = evalProgress.find(p => p.percent !== undefined);
-    if (withPercent) {
-        return withPercent;
+    // 第一步：如果只有一个 entry 或没有 model_name，沿用旧的"取第一个 percent"逻辑。
+    const withModel = evalProgress.filter(p => (p?.model_name || p?.model));
+    if (withModel.length <= 1) {
+        const withPercent = evalProgress.find(p => p.percent !== undefined);
+        if (withPercent) return withPercent;
+        return evalProgress[0];
     }
 
-    // 否则使用第一个项目
-    return evalProgress[0];
+    // Multi-model：聚合 percent。terminal status 计 100%，否则取 percent（fallback 0）。
+    let sum = 0;
+    let count = 0;
+    let lastBench: string | undefined;
+    let lastStage: string | undefined;
+    for (const p of withModel) {
+        const status = p?.status;
+        const pct = typeof p?.percent === "number" ? p.percent : 0;
+        const eff = status === "success" || status === "failed" || status === "cancelled" || p?.stage === "done"
+            ? 100
+            : pct;
+        sum += eff;
+        count += 1;
+        if (p?.bench_name) lastBench = p.bench_name;
+        if (p?.stage) lastStage = p.stage;
+    }
+    const avg = count > 0 ? sum / count : 0;
+    return {
+        percent: avg,
+        bench_name: lastBench,
+        stage: lastStage,
+    };
 };
 
 const getOverallProgress = (nodeName: string | null | undefined, evalProgress?: Array<{
@@ -1299,20 +1443,65 @@ export const WorkflowBlock = ({ title, icon: Icon, nodes, activeNodeId, status, 
 
 
 // --- Summary Bench Card Component ---
-const SummaryBenchCard = ({ bench, lang }: { bench: any, lang: Lang }) => {
+const SummaryBenchCard = ({
+    bench,
+    lang,
+    workflowMeta,
+    onRetryModel,
+}: {
+    bench: any;
+    lang: Lang;
+    workflowMeta?: WorkflowMetaSnapshot | null;
+    onRetryModel?: (benchName: string, modelName: string) => void;
+}) => {
     const tt = (zh: string, en: string) => (lang === "zh" ? zh : en);
     const [isResultOpen, setIsResultOpen] = useState(true);
     // const [isSummaryOpen, setIsSummaryOpen] = useState(false);
 
-    // 支持多模型结果
-    const evalResults = bench.meta?.eval_results || {};  // 多模型: {model_name: {stats, detail_path}}
+    // 支持多模型结果（新 schema：eval_results[model] 带 status/error/stats/detail_path）
+    const evalResults = bench.meta?.eval_results || {};  // 多模型: {model_name: {status, stats, detail_path, error, ...}}
     const singleResult = bench.meta?.eval_result;  // 单模型兼容
     const hasMultipleResults = Object.keys(evalResults).length > 0;
     const hasSingleResult = singleResult && Object.keys(singleResult).length > 0;
     // const hasSummary = !!bench.meta?.metric_summary;
 
-    // 获取所有模型的结果
+    // 获取所有模型的名字（含失败 / 取消的）
     const modelNames = hasMultipleResults ? Object.keys(evalResults) : (hasSingleResult ? ["Model"] : []);
+
+    // 从 workflow_meta 优先取 status（更精确，eval_results 也有 status 兜底）
+    const metaBench = workflowMeta?.benches?.[bench.bench_name];
+    const getModelStatus = (name: string): string | undefined => {
+        const fromMeta = metaBench?.models?.[name]?.status;
+        if (fromMeta) return fromMeta;
+        return (evalResults[name] as any)?.status;
+    };
+    const getModelError = (name: string): string | undefined => {
+        const fromMeta = metaBench?.models?.[name]?.error;
+        if (typeof fromMeta === "string" && fromMeta) return fromMeta;
+        return (evalResults[name] as any)?.error;
+    };
+    const getModelFailureCount = (name: string): { cf?: number; mf?: number; lastError?: string | null } => {
+        const meta = metaBench?.models?.[name];
+        const slot = (evalResults[name] as any) || {};
+        return {
+            cf: meta?.consecutive_failures ?? slot.consecutive_failures,
+            mf: meta?.max_failures ?? slot.max_failures,
+            lastError: meta?.last_error ?? slot.last_error ?? null,
+        };
+    };
+
+    // 整体圆点颜色：success / partial / failed / running / pending
+    const overallStatus = bench.eval_status;
+    const overallDotCls =
+        overallStatus === "success"
+            ? "bg-emerald-500"
+            : overallStatus === "partial"
+                ? "bg-amber-500"
+                : overallStatus === "failed"
+                    ? "bg-red-500"
+                    : overallStatus === "running"
+                        ? "bg-blue-500 animate-pulse"
+                        : "bg-slate-200";
 
     return (
         <div className={cn(
@@ -1321,10 +1510,10 @@ const SummaryBenchCard = ({ bench, lang }: { bench: any, lang: Lang }) => {
         )}>
             <div className="flex justify-between items-start">
                 <span className="font-bold text-sm text-slate-800 line-clamp-1" title={bench.bench_name}>{bench.bench_name}</span>
-                <div className={cn(
-                    "w-2 h-2 rounded-full ring-2 ring-white shrink-0 ml-2",
-                    bench.eval_status === "success" ? "bg-emerald-500" : "bg-slate-200"
-                )} />
+                <div
+                    className={cn("w-2 h-2 rounded-full ring-2 ring-white shrink-0 ml-2", overallDotCls)}
+                    title={overallStatus || ""}
+                />
             </div>
 
             <div className="space-y-2">
@@ -1346,9 +1535,36 @@ const SummaryBenchCard = ({ bench, lang }: { bench: any, lang: Lang }) => {
                                      <thead>
                                          <tr className="border-b border-slate-200">
                                              <th className="text-left py-1 px-2 text-slate-500 font-medium">{tt("指标", "Metric")}</th>
-                                             {modelNames.map(name => (
-                                                 <th key={name} className="text-right py-1 px-2 text-slate-700 font-semibold truncate max-w-[120px]" title={name}>{name}</th>
-                                             ))}
+                                             {modelNames.map(name => {
+                                                 const st = getModelStatus(name);
+                                                 const err = getModelError(name);
+                                                 const fc = getModelFailureCount(name);
+                                                 const canRetry = (st === "failed" || st === "cancelled") && !!onRetryModel;
+                                                 return (
+                                                     <th key={name} className="text-right py-1 px-2 text-slate-700 font-semibold align-bottom">
+                                                         <div className="flex items-center justify-end gap-1.5 flex-wrap">
+                                                             <span className="truncate max-w-[120px]" title={err ? `${name}\n${err}` : name}>{name}</span>
+                                                             <ModelStatusBadge status={st} lang={lang} />
+                                                             <FailureCounterBadge
+                                                                 consecutive={fc.cf}
+                                                                 max={fc.mf}
+                                                                 lastError={fc.lastError}
+                                                                 lang={lang}
+                                                             />
+                                                             {canRetry && (
+                                                                 <button
+                                                                     type="button"
+                                                                     onClick={() => onRetryModel?.(bench.bench_name, name)}
+                                                                     className="w-5 h-5 rounded-full flex items-center justify-center text-blue-500 hover:bg-blue-50 transition-colors"
+                                                                     title={tt("重试该模型", "Retry this model")}
+                                                                 >
+                                                                     <RotateCw className="w-3 h-3" />
+                                                                 </button>
+                                                             )}
+                                                         </div>
+                                                     </th>
+                                                 );
+                                             })}
                                          </tr>
                                      </thead>
                                      <tbody>
@@ -1611,6 +1827,7 @@ export const SummaryPanel = ({
   onViewJudgeResult,
   isFullscreen, onFullscreenChange,
   onPreviewModel, onDownloadModel,
+  workflowMeta, sseAlive, onRetryModel,
 }: {
     state: WorkflowState | null,
     threadId: string | null,
@@ -1625,6 +1842,9 @@ export const SummaryPanel = ({
     onFullscreenChange?: (fullscreen: boolean) => void,
     onPreviewModel?: (bench: string, model: string) => void,
     onDownloadModel?: (bench: string, model: string) => void,
+    workflowMeta?: WorkflowMetaSnapshot | null,
+    sseAlive?: boolean,
+    onRetryModel?: (benchName: string, modelName: string) => void,
 }) => {
     const tt = (zh: string, en: string) => (lang === "zh" ? zh : en);
     const [isOpen, setIsOpen] = React.useState(true);
@@ -1743,124 +1963,218 @@ export const SummaryPanel = ({
                             >
                                 {/* Tab 1: 上下文 */}
                                 {viewMode === "benches" && (
-                                    <div className="p-6 overflow-y-auto flex-1 scrollbar-thin scrollbar-thumb-slate-200">
-                                        <div className="flex gap-4 pb-4 scrollbar-hide items-start">
-                                            {state.benches?.length ? state.benches.map((b: any, i: number) => (
-                                                <SummaryBenchCard key={i} bench={b} lang={lang} />
-                                            )) : (
-                                                <div className="h-24 w-full border-2 border-dashed border-slate-100 rounded-xl flex items-center justify-center text-xs text-slate-400">
-                                                    {tt("暂无已选基准", "No benchmarks selected")}
+                                    <TabErrorBoundary fallbackLabel={tt("上下文渲染出错，请刷新", "Context render error, please refresh")}>
+                                        <div className="p-6 overflow-y-auto flex-1 scrollbar-thin scrollbar-thumb-slate-200">
+                                            {/* 顶部状态条：SSE 实时 vs 轮询；workflow_meta 顶层 status / cancel_reason */}
+                                            {(workflowMeta?.status || sseAlive !== undefined) && (
+                                                <div className="flex items-center gap-2 mb-4 text-[10px]">
+                                                    {sseAlive ? (
+                                                        <span className="bg-emerald-50 text-emerald-700 border border-emerald-100 px-1.5 py-0.5 rounded font-bold uppercase tracking-wider">
+                                                            LIVE
+                                                        </span>
+                                                    ) : (
+                                                        <span className="bg-slate-50 text-slate-500 border border-slate-100 px-1.5 py-0.5 rounded font-bold uppercase tracking-wider">
+                                                            POLL
+                                                        </span>
+                                                    )}
+                                                    {workflowMeta?.status && (
+                                                        <span className="text-slate-500">
+                                                            {tt("流程状态", "Workflow")}: <b className="text-slate-700">{workflowMeta.status}</b>
+                                                        </span>
+                                                    )}
+                                                    {workflowMeta?.cancel_reason && (
+                                                        <span className="text-red-600" title={workflowMeta.cancel_reason}>
+                                                            {tt("取消原因", "Cancelled")}: {workflowMeta.cancel_reason}
+                                                        </span>
+                                                    )}
                                                 </div>
                                             )}
+                                            <div className="flex gap-4 pb-4 scrollbar-hide items-start">
+                                                {state.benches?.length ? state.benches.map((b: any, i: number) => (
+                                                    <SummaryBenchCard
+                                                        key={i}
+                                                        bench={b}
+                                                        lang={lang}
+                                                        workflowMeta={workflowMeta}
+                                                        onRetryModel={onRetryModel}
+                                                    />
+                                                )) : (
+                                                    <div className="h-24 w-full border-2 border-dashed border-slate-100 rounded-xl flex items-center justify-center text-xs text-slate-400">
+                                                        {tt("暂无已选基准", "No benchmarks selected")}
+                                                    </div>
+                                                )}
+                                            </div>
                                         </div>
-                                    </div>
+                                    </TabErrorBoundary>
                                 )}
 
                                 {/* Tab 2: 模型输出 */}
                                 {viewMode === "output" && (
-                                    <div className="p-6 overflow-y-auto flex-1 scrollbar-thin scrollbar-thumb-slate-200">
-                                        {(() => {
-                                          // Collect all models with results across all benches
-                                          const entries: { bench: string; model: string; stats: Record<string, any> }[] = [];
-                                          state.benches?.forEach((b: any) => {
-                                            const er = b.meta?.eval_results || {};
-                                            for (const [name, info] of Object.entries(er)) {
-                                              entries.push({ bench: b.bench_name, model: name, stats: (info as any)?.stats || {} });
-                                            }
-                                          });
-                                          if (entries.length === 0 && state.reports?.["default"]) {
-                                            return (
-                                              <div className="max-w-5xl mx-auto">
-                                                <ReportView report={state.reports["default"]} threadId={threadId} lang={lang} />
-                                              </div>
-                                            );
-                                          }
-                                          if (entries.length === 0) {
-                                            return (
-                                              <div className="flex flex-col items-center justify-center py-16 text-slate-400">
-                                                <Bot className="w-12 h-12 mb-3 opacity-30" />
-                                                <p className="text-sm">{tt("暂无模型输出数据", "No model output data yet")}</p>
-                                              </div>
-                                            );
-                                          }
-                                          return (
-                                            <div className="max-w-5xl mx-auto space-y-4">
-                                              {entries.map(({ bench, model, stats }) => (
-                                                <div key={`${bench}-${model}`} className="bg-white rounded-lg border border-slate-100 p-4 shadow-sm">
-                                                  <div className="flex items-center justify-between mb-2">
-                                                    <div className="flex items-center gap-2">
-                                                      <span className="text-sm font-bold text-slate-700">{bench}</span>
-                                                      <span className="text-[10px] bg-blue-50 text-blue-600 px-1.5 py-0.5 rounded">{model}</span>
-                                                    </div>
-                                                    <div className="flex items-center gap-2">
-                                                      <button
-                                                        type="button"
-                                                        className="text-[10px] bg-blue-500 hover:bg-blue-600 text-white px-2 py-1 rounded-md font-medium transition-colors flex items-center gap-1 cursor-pointer"
-                                                        onClick={() => onPreviewModel?.(bench, model)}
-                                                      ><Eye className="w-3 h-3" /> {tt("预览", "Preview")}</button>
-                                                      <button
-                                                        type="button"
-                                                        className="text-[10px] bg-emerald-500 hover:bg-emerald-600 text-white px-2 py-1 rounded-md font-medium transition-colors flex items-center gap-1 cursor-pointer"
-                                                        onClick={() => onDownloadModel?.(bench, model)}
-                                                      ><Download className="w-3 h-3" /> {tt("下载", "Download")}</button>
-                                                    </div>
+                                    <TabErrorBoundary fallbackLabel={tt("模型输出渲染出错，请刷新", "Model Output render error, please refresh")}>
+                                        <div className="p-6 overflow-y-auto flex-1 scrollbar-thin scrollbar-thumb-slate-200">
+                                            {(() => {
+                                              // Collect all models across all benches. Include failed / cancelled
+                                              // entries too (status badge will distinguish them); only filter when
+                                              // there's literally no eval_results dict.
+                                              type OutputEntry = {
+                                                  bench: string;
+                                                  model: string;
+                                                  stats: Record<string, any>;
+                                                  status?: string;
+                                                  error?: string;
+                                                  consecutive_failures?: number;
+                                                  max_failures?: number;
+                                                  last_error?: string | null;
+                                              };
+                                              const entries: OutputEntry[] = [];
+                                              state.benches?.forEach((b: any) => {
+                                                const er = b.meta?.eval_results || {};
+                                                for (const [name, info] of Object.entries(er)) {
+                                                  const i = (info as any) || {};
+                                                  entries.push({
+                                                      bench: b.bench_name,
+                                                      model: name,
+                                                      stats: i.stats || {},
+                                                      status: i.status,
+                                                      error: i.error,
+                                                      consecutive_failures: i.consecutive_failures,
+                                                      max_failures: i.max_failures,
+                                                      last_error: i.last_error,
+                                                  });
+                                                }
+                                              });
+                                              if (entries.length === 0 && state.reports?.["default"]) {
+                                                return (
+                                                  <div className="max-w-5xl mx-auto">
+                                                    <ReportView report={state.reports["default"]} threadId={threadId} lang={lang} />
                                                   </div>
-                                                  {Object.keys(stats).length > 0 ? (
-                                                    <div className="flex flex-wrap gap-2">
-                                                      {Object.entries(stats)
-                                                        .filter(([k]) => !["bench_name_or_prefix", "metric", "type"].includes(k))
-                                                        .map(([k, v]) => (
-                                                          <span key={k} className="text-xs bg-slate-50 px-2 py-1 rounded border border-slate-100">
-                                                            <span className="text-slate-400">{k}:</span>{" "}
-                                                            <span className="font-mono font-bold text-slate-600">{typeof v === "number" ? (Number.isInteger(v) ? v : v.toFixed(4)) : String(v)}</span>
-                                                          </span>
-                                                        ))
-                                                      }
-                                                    </div>
-                                                  ) : (
-                                                    <span className="text-xs text-slate-400 italic">{tt("仅生成结果（无评估指标）", "Generation only (no eval metrics)")}</span>
-                                                  )}
+                                                );
+                                              }
+                                              if (entries.length === 0) {
+                                                return (
+                                                  <div className="flex flex-col items-center justify-center py-16 text-slate-400">
+                                                    <Bot className="w-12 h-12 mb-3 opacity-30" />
+                                                    <p className="text-sm">{tt("暂无模型输出数据", "No model output data yet")}</p>
+                                                  </div>
+                                                );
+                                              }
+                                              return (
+                                                <div className="max-w-5xl mx-auto space-y-4">
+                                                  {entries.map(({ bench, model, stats, status: st, error: err, consecutive_failures: cf, max_failures: mf, last_error: le }) => {
+                                                    const isFailed = st === "failed" || st === "cancelled";
+                                                    const canRetry = isFailed && !!onRetryModel;
+                                                    return (
+                                                      <div
+                                                          key={`${bench}-${model}`}
+                                                          className={cn(
+                                                              "bg-white rounded-lg border p-4 shadow-sm",
+                                                              isFailed ? "border-red-200" : "border-slate-100",
+                                                          )}
+                                                      >
+                                                        <div className="flex items-center justify-between mb-2">
+                                                          <div className="flex items-center gap-2 flex-wrap">
+                                                            <span className="text-sm font-bold text-slate-700">{bench}</span>
+                                                            <span className="text-[10px] bg-blue-50 text-blue-600 px-1.5 py-0.5 rounded">{model}</span>
+                                                            <ModelStatusBadge status={st} lang={lang} />
+                                                            <FailureCounterBadge
+                                                                consecutive={cf}
+                                                                max={mf}
+                                                                lastError={le || err}
+                                                                lang={lang}
+                                                            />
+                                                          </div>
+                                                          <div className="flex items-center gap-2">
+                                                            {!isFailed && (
+                                                              <>
+                                                                <button
+                                                                  type="button"
+                                                                  className="text-[10px] bg-blue-500 hover:bg-blue-600 text-white px-2 py-1 rounded-md font-medium transition-colors flex items-center gap-1 cursor-pointer"
+                                                                  onClick={() => onPreviewModel?.(bench, model)}
+                                                                ><Eye className="w-3 h-3" /> {tt("预览", "Preview")}</button>
+                                                                <button
+                                                                  type="button"
+                                                                  className="text-[10px] bg-emerald-500 hover:bg-emerald-600 text-white px-2 py-1 rounded-md font-medium transition-colors flex items-center gap-1 cursor-pointer"
+                                                                  onClick={() => onDownloadModel?.(bench, model)}
+                                                                ><Download className="w-3 h-3" /> {tt("下载", "Download")}</button>
+                                                              </>
+                                                            )}
+                                                            {canRetry && (
+                                                              <button
+                                                                type="button"
+                                                                className="text-[10px] bg-amber-500 hover:bg-amber-600 text-white px-2 py-1 rounded-md font-medium transition-colors flex items-center gap-1 cursor-pointer"
+                                                                onClick={() => onRetryModel?.(bench, model)}
+                                                                title={tt("重试该模型", "Retry this model")}
+                                                              ><RotateCw className="w-3 h-3" /> {tt("重试", "Retry")}</button>
+                                                            )}
+                                                          </div>
+                                                        </div>
+                                                        {isFailed && err && (
+                                                          <div className="text-[11px] text-red-600 font-mono whitespace-pre-wrap break-all bg-red-50/50 border border-red-100 rounded px-2 py-1.5 mb-2">
+                                                            {err}
+                                                          </div>
+                                                        )}
+                                                        {Object.keys(stats).length > 0 ? (
+                                                          <div className="flex flex-wrap gap-2">
+                                                            {Object.entries(stats)
+                                                              .filter(([k]) => !["bench_name_or_prefix", "metric", "type"].includes(k))
+                                                              .map(([k, v]) => (
+                                                                <span key={k} className="text-xs bg-slate-50 px-2 py-1 rounded border border-slate-100">
+                                                                  <span className="text-slate-400">{k}:</span>{" "}
+                                                                  <span className="font-mono font-bold text-slate-600">{typeof v === "number" ? (Number.isInteger(v) ? v : v.toFixed(4)) : String(v)}</span>
+                                                                </span>
+                                                              ))
+                                                            }
+                                                          </div>
+                                                        ) : !isFailed ? (
+                                                          <span className="text-xs text-slate-400 italic">{tt("仅生成结果（无评估指标）", "Generation only (no eval metrics)")}</span>
+                                                        ) : null}
+                                                      </div>
+                                                    );
+                                                  })}
                                                 </div>
-                                              ))}
-                                            </div>
-                                          );
-                                        })()}
-                                    </div>
+                                              );
+                                            })()}
+                                        </div>
+                                    </TabErrorBoundary>
                                 )}
 
                                 {/* Tab 3: 裁判评分 */}
                                 {viewMode === "judge" && (
-                                  <JudgeTabContent
-                                    state={state}
-                                    lang={lang}
-                                    apiBaseUrl={apiBaseUrl}
-                                    threadId={threadId}
-                                    judgeTabState={judgeTabState}
-                                    onJudgeAction={onJudgeAction}
-                                    onViewJudgeResult={onViewJudgeResult}
-                                  />
+                                  <TabErrorBoundary fallbackLabel={tt("裁判评分渲染出错，请刷新", "Judge tab render error, please refresh")}>
+                                    <JudgeTabContent
+                                      state={state}
+                                      lang={lang}
+                                      apiBaseUrl={apiBaseUrl}
+                                      threadId={threadId}
+                                      judgeTabState={judgeTabState}
+                                      onJudgeAction={onJudgeAction}
+                                      onViewJudgeResult={onViewJudgeResult}
+                                    />
+                                  </TabErrorBoundary>
                                 )}
 
                                 {/* Tab 4: 分析报告 */}
                                 {viewMode === "report" && (
-                                  <div className="p-6 overflow-y-auto flex-1 scrollbar-thin scrollbar-thumb-slate-200">
-                                    <div className="max-w-5xl mx-auto">
-                                      {judgeTabState.judgeReportStatus === 'generating' ? (
-                                        <div className="flex flex-col items-center justify-center py-16 text-slate-400">
-                                          <Loader2 className="w-8 h-8 animate-spin text-blue-500 mb-3" />
-                                          <p className="text-sm">{tt("正在生成分析报告...", "Generating analysis report...")}</p>
-                                          <p className="text-xs text-slate-300 mt-1">{tt("LLM 正在分析评分数据", "LLM is analyzing judge results")}</p>
-                                        </div>
-                                      ) : judgeTabState.judgeReport ? (
-                                        <JudgeReportView report={judgeTabState.judgeReport} lang={lang} />
-                                      ) : (
-                                        <div className="flex flex-col items-center justify-center py-16 text-slate-400">
-                                          <BarChart3 className="w-12 h-12 mb-3 opacity-30" />
-                                          <p className="text-sm">{tt("请先完成裁判评分，然后生成分析报告", "Complete judging first, then generate the analysis report")}</p>
-                                        </div>
-                                      )}
+                                  <TabErrorBoundary fallbackLabel={tt("分析报告渲染出错，请刷新", "Report tab render error, please refresh")}>
+                                    <div className="p-6 overflow-y-auto flex-1 scrollbar-thin scrollbar-thumb-slate-200">
+                                      <div className="max-w-5xl mx-auto">
+                                        {judgeTabState.judgeReportStatus === 'generating' ? (
+                                          <div className="flex flex-col items-center justify-center py-16 text-slate-400">
+                                            <Loader2 className="w-8 h-8 animate-spin text-blue-500 mb-3" />
+                                            <p className="text-sm">{tt("正在生成分析报告...", "Generating analysis report...")}</p>
+                                            <p className="text-xs text-slate-300 mt-1">{tt("LLM 正在分析评分数据", "LLM is analyzing judge results")}</p>
+                                          </div>
+                                        ) : judgeTabState.judgeReport ? (
+                                          <JudgeReportView report={judgeTabState.judgeReport} lang={lang} />
+                                        ) : (
+                                          <div className="flex flex-col items-center justify-center py-16 text-slate-400">
+                                            <BarChart3 className="w-12 h-12 mb-3 opacity-30" />
+                                            <p className="text-sm">{tt("请先完成裁判评分，然后生成分析报告", "Complete judging first, then generate the analysis report")}</p>
+                                          </div>
+                                        )}
+                                      </div>
                                     </div>
-                                  </div>
+                                  </TabErrorBoundary>
                                 )}
                             </motion.div>
                         )}

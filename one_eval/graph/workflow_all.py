@@ -41,6 +41,13 @@ def _route_after_eval(state: NodeState) -> str:
     if cursor < len(benches):
         return "DataFlowEvalNode"
 
+    # 防止 langgraph checkpoint replay 重复跑 ReportGen：
+    # 如果 reports 已生成，直接 END。
+    reports = getattr(state, "reports", None) or {}
+    if reports and reports.get("default"):
+        log.info("Reports already generated, routing to END to avoid duplicate ReportGen.")
+        return END
+
     # 检查是否是无参考答案的评测（仅生成模式）
     has_reference_answers = False
     for bench in benches:

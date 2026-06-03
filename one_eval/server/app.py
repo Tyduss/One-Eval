@@ -13,10 +13,13 @@ from contextlib import asynccontextmanager
 import requests
 from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from one_eval.logger import get_logger
 from one_eval.toolkits.hf_download_tool import HFDownloadTool
 from one_eval.runtime.progress_store import get_progress, clear_progress
+from one_eval.runtime import progress_store, workflow_meta_store
+from one_eval.runtime.task_registry import cancel_thread
 
 log = get_logger("OneEval-Server")
 
@@ -325,6 +328,10 @@ class AgentTestResponse(BaseModel):
 
 app = FastAPI(title="One Eval API")
 RUNNING_WORKFLOW_TASKS: Dict[str, asyncio.Task] = {}
+
+# Load persisted per-thread workflow meta (per-bench × per-model status / progress).
+# Mirrors the JUDGE_TASK_META pattern (see _load_judge_meta below).
+workflow_meta_store.load_workflow_meta()
 
 app.add_middleware(
     CORSMiddleware,
@@ -645,6 +652,11 @@ class RerunExecutionRequest(BaseModel):
     state_updates: Optional[Dict[str, Any]] = None
     goto_confirm: bool = True
 
+
+class RerunModelRequest(BaseModel):
+    bench_name: str
+    model_name: str
+
 class ManualBenchRequest(BaseModel):
     bench_name: str
     dataset_cache: str
@@ -750,11 +762,15 @@ async def run_graph_background(thread_id: str, input_state: Any, resume_command:
     # Ensure env is fresh (though we set it at top level, dynamic updates might need this)
     apply_hf_env_from_config(load_server_config())
     apply_agent_env_from_config(load_server_config())
-    
+
+    # Record thread as running in the persistent workflow meta (per-bench/model status
+    # is mirrored separately inside DataFlowEvalNode).
+    workflow_meta_store.init_thread(thread_id)
+
     async with get_checkpointer(DB_PATH, mode="run") as checkpointer:
         graph = build_complete_workflow(checkpointer=checkpointer)
         config = {"configurable": {"thread_id": thread_id}}
-        
+
         try:
             _touch_thread_updated_at(thread_id)
             log.info(f"Invoking graph for {thread_id}")
@@ -769,17 +785,21 @@ async def run_graph_background(thread_id: str, input_state: Any, resume_command:
                 log.info(f"Graph interrupted for {thread_id}, interrupts: {result['__interrupt__']}")
                 _thread_interrupt_cache[thread_id] = True
                 _touch_thread_updated_at(thread_id)
+                workflow_meta_store.mark_thread(thread_id, "interrupted")
             else:
                 log.info(f"Graph execution finished for {thread_id}")
                 _thread_interrupt_cache.pop(thread_id, None)
                 _touch_thread_updated_at(thread_id)
+                workflow_meta_store.mark_thread(thread_id, "completed")
         except asyncio.CancelledError:
             log.warning(f"Graph execution cancelled by user for {thread_id}")
             _touch_thread_updated_at(thread_id)
+            workflow_meta_store.mark_thread(thread_id, "cancelled", cancel_reason="user_stop")
             raise
         except Exception as e:
             log.error(f"Error executing graph for {thread_id}: {e}")
             _touch_thread_updated_at(thread_id)
+            workflow_meta_store.mark_thread(thread_id, "failed", error=str(e))
         finally:
             clear_progress(thread_id)
             task = RUNNING_WORKFLOW_TASKS.get(thread_id)
@@ -797,18 +817,95 @@ def _launch_graph_task(thread_id: str, input_state: Any = None, resume_command: 
 
 @app.post("/api/workflow/stop/{thread_id}")
 async def stop_workflow(thread_id: str):
+    # 1) 先广播 cancel：让 DataFlowEvalNode 里的 watcher 线程协作退出。
+    #    asyncio.Task.cancel() 单独是不够的，因为评测实际跑在 run_in_executor
+    #    默认线程池里，cancel 穿不透。
+    cancel_signaled = cancel_thread(thread_id, reason="user_stop")
+
     task = RUNNING_WORKFLOW_TASKS.get(thread_id)
     if not task:
         log.info(f"Stop request for {thread_id}, but no running task found.")
-        return {"thread_id": thread_id, "status": "idle", "detail": "no running workflow"}
+        return {
+            "thread_id": thread_id,
+            "status": "idle",
+            "detail": "no running workflow",
+            "cancel_signaled": cancel_signaled,
+        }
     if task.done():
         RUNNING_WORKFLOW_TASKS.pop(thread_id, None)
         log.info(f"Stop request for {thread_id}, task already finished.")
-        return {"thread_id": thread_id, "status": "idle", "detail": "workflow already finished"}
-    
+        return {
+            "thread_id": thread_id,
+            "status": "idle",
+            "detail": "workflow already finished",
+            "cancel_signaled": cancel_signaled,
+        }
+
     log.warning(f"Stop request received for {thread_id}. Cancelling task...")
     task.cancel()
-    return {"thread_id": thread_id, "status": "stopping"}
+    return {"thread_id": thread_id, "status": "stopping", "cancel_signaled": cancel_signaled}
+
+@app.get("/api/workflow/events/{thread_id}")
+async def workflow_events(thread_id: str):
+    """SSE 长连接：把 progress_store 里关于此 thread 的进度增量实时推给前端。
+    前端约定：snapshot/progress/end 三种事件 + 15s 一次 ":keepalive" 注释。
+    若此 endpoint 不可达，前端会自动 fallback 到 /api/workflow/status 轮询。
+    """
+
+    async def event_stream():
+        # 1) 初始 snapshot：给新订阅者一个最新的全量状态。
+        snapshot = {
+            "eval_progress": get_progress(thread_id),
+            "workflow_meta": workflow_meta_store.get_thread_meta(thread_id),
+        }
+        yield f"event: snapshot\ndata: {json.dumps(snapshot, ensure_ascii=False, default=str)}\n\n"
+
+        # 2) 订阅进度增量。set_progress 会通过 call_soon_threadsafe 把
+        #    payload 投递到本 loop 的 queue 上。
+        queue = progress_store.subscribe(thread_id)
+        try:
+            # Early-exit short-circuit: if thread is already terminal, send `end`
+            # immediately instead of waiting up to 15s for the first keepalive tick.
+            meta0 = workflow_meta_store.get_thread_meta(thread_id) or {}
+            if meta0.get("status") in ("completed", "failed", "cancelled"):
+                yield "event: end\ndata: {}\n\n"
+                return
+
+            while True:
+                try:
+                    payload = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    yield f"event: progress\ndata: {json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
+                except asyncio.TimeoutError:
+                    # SSE comment 防止反代/防火墙关掉空闲连接。
+                    yield ": keepalive\n\n"
+                meta = workflow_meta_store.get_thread_meta(thread_id) or {}
+                if meta.get("status") in ("completed", "failed", "cancelled"):
+                    yield "event: end\ndata: {}\n\n"
+                    break
+        finally:
+            progress_store.unsubscribe(thread_id, queue)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            # 让 nginx / 反向代理不要缓冲 SSE 输出。
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/api/workflow/meta/{thread_id}")
+async def get_workflow_meta(thread_id: str):
+    """返回某 thread 的 per-bench × per-model 状态/进度快照（持久化版）。
+    供 SSE 失败/重连后前端拉一次全量状态用。"""
+    meta = workflow_meta_store.get_thread_meta(thread_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="thread not found in workflow_meta")
+    return meta
+
 
 @app.get("/api/workflow/status/{thread_id}")
 async def get_status(thread_id: str):
@@ -910,6 +1007,7 @@ async def get_status(thread_id: str):
                 "state_values": current_values,
                 "interrupts": [{"value": i.value} for i in interrupts] if interrupts else [],
                 "eval_progress": get_progress(thread_id),
+                "workflow_meta": workflow_meta_store.get_thread_meta(thread_id),
             }
 
         return {"thread_id": thread_id, "status": "completed"}
@@ -1132,6 +1230,75 @@ async def rerun_execution(thread_id: str, req: RerunExecutionRequest):
     goto_node = "PreEvalReviewNode" if req.goto_confirm else "DataFlowEvalNode"
     _launch_graph_task(thread_id, None, resume_command=Command(goto=goto_node))
     return {"ok": True, "status": "queued", "goto": goto_node}
+
+
+@app.post("/api/workflow/rerun_model/{thread_id}")
+async def rerun_model(thread_id: str, req: RerunModelRequest):
+    """只重跑某个 (bench, model)，不影响同 bench 其他已成功的 model。
+    依赖 DataFlowEvalNode 的 'all_done 跳过' 逻辑：把目标 model 的 status 重置为 pending
+    并把 bench 的 eval_status 拉回 pending，node 进入后会发现仅此 model 未完成。
+    """
+    async with get_checkpointer(DB_PATH, mode="run") as checkpointer:
+        graph = build_complete_workflow(checkpointer=checkpointer)
+        config = {"configurable": {"thread_id": thread_id}}
+
+        try:
+            snap = await graph.aget_state(config)
+        except Exception:
+            raise HTTPException(status_code=404, detail="thread not found")
+
+        if not snap or not snap.values:
+            raise HTTPException(status_code=404, detail="thread not found")
+
+        values = snap.values
+        benches_any = values.get("benches") or []
+        if not isinstance(benches_any, list):
+            raise HTTPException(status_code=400, detail="invalid state benches")
+
+        benches_list: List[BenchInfo] = []
+        for b in benches_any:
+            if isinstance(b, BenchInfo):
+                benches_list.append(b)
+            elif isinstance(b, dict):
+                benches_list.append(_coerce_bench_info(b))
+
+        target_idx: Optional[int] = None
+        for i, b in enumerate(benches_list):
+            if b.bench_name == req.bench_name:
+                target_idx = i
+                break
+        if target_idx is None:
+            raise HTTPException(status_code=404, detail=f"bench not found: {req.bench_name}")
+
+        bench = benches_list[target_idx]
+        if not isinstance(bench.meta, dict):
+            bench.meta = {}
+        eval_results = bench.meta.setdefault("eval_results", {})
+        if req.model_name not in eval_results:
+            raise HTTPException(
+                status_code=404,
+                detail=f"model {req.model_name} not present in eval_results for bench {req.bench_name}",
+            )
+
+        # Reset only the target model's slot; preserve other models' results.
+        eval_results[req.model_name] = {"status": "pending"}
+        # Pull bench-level status back so DataFlowEvalNode's "all_done?" check fails and re-enters.
+        bench.eval_status = "pending"
+        for k in ("eval_error", "eval_per_model_errors", "eval_abnormality"):
+            bench.meta.pop(k, None)
+
+        await graph.aupdate_state(
+            config,
+            {"benches": benches_list, "eval_cursor": target_idx},
+        )
+
+    _launch_graph_task(thread_id, None, resume_command=Command(goto="DataFlowEvalNode"))
+    return {
+        "ok": True,
+        "status": "queued",
+        "bench_name": req.bench_name,
+        "model_name": req.model_name,
+    }
 
 @app.post("/api/workflow/manual_start")
 async def manual_start(req: ManualStartRequest):
@@ -2356,17 +2523,22 @@ def _count_file_rows(file_path: Path, ext: str) -> int:
 #       otherwise FastAPI matches "csv"/"xlsx" as thread_id.
 
 def _find_result_file(bench_name: str, model_name: str, thread_id: str | None = None):
-    """查找评测结果文件，返回路径或 None"""
+    """查找评测结果文件，返回路径或 None。
+    使用 glob.escape 转义 bench/model 名里可能出现的通配符（如 *、?、[），
+    并且不再用宽松的 *.jsonl fallback——后者会误匹配 step_step0.jsonl（输入数据）。
+    """
     import glob
+    safe_bench = glob.escape(bench_name)
+    safe_model = glob.escape(model_name)
     search_patterns = [
-        f"{REPO_ROOT}/cache/eval_results/{bench_name}_{model_name}_*/step_step1.jsonl",
-        f"{REPO_ROOT}/cache/eval_results/{bench_name}_{model_name}_*/*.jsonl",
-        f"{REPO_ROOT}/cache/eval_results/{bench_name}_{model_name}_*/*.json",
+        f"{REPO_ROOT}/cache/eval_results/{safe_bench}_{safe_model}_*/step_step1.jsonl",
+        f"{REPO_ROOT}/cache/eval_results/{safe_bench}_{safe_model}_*/step_step2.jsonl",
     ]
     if thread_id:
+        safe_tid = glob.escape(thread_id)
         search_patterns.extend([
-            f"{REPO_ROOT}/results/{thread_id}/{bench_name}/{model_name}/*.json",
-            f"{REPO_ROOT}/results/{thread_id}/{bench_name}/{model_name}/*.jsonl",
+            f"{REPO_ROOT}/results/{safe_tid}/{safe_bench}/{safe_model}/*.json",
+            f"{REPO_ROOT}/results/{safe_tid}/{safe_bench}/{safe_model}/*.jsonl",
         ])
     for pattern in search_patterns:
         files = glob.glob(pattern)
@@ -2465,71 +2637,38 @@ async def download_eval_xlsx(thread_id: str, bench_name: str, model_name: str):
 
 @app.get("/api/eval/result/{thread_id}/{bench_name}/{model_name}")
 async def download_eval_result(thread_id: str, bench_name: str, model_name: str):
-    """下载评测结果文件 - 简化版本，直接从已知路径查找"""
+    """下载评测结果文件 - 简化版本，直接从已知路径查找。
+    走 _find_result_file 统一逻辑（safe escaping、不再宽松 fallback）。"""
     from fastapi.responses import FileResponse
-    import glob
 
-    # 根据日志中的路径模式查找结果文件
-    # 路径模式：/Users/t/One-Eval/cache/eval_results/{bench_name}_{model_name}_*/step_step1.jsonl
+    result_file = _find_result_file(bench_name, model_name, thread_id)
+    if not result_file or not os.path.exists(result_file):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Result file not found for {bench_name}/{model_name}. Check cache/eval_results/ directory.",
+        )
 
-    # 查找可能的文件路径（从项目根目录开始）
-    search_patterns = [
-        f"{REPO_ROOT}/cache/eval_results/{bench_name}_{model_name}_*/step_step1.jsonl",
-        f"{REPO_ROOT}/cache/eval_results/{bench_name}_{model_name}_*/*.jsonl",
-        f"{REPO_ROOT}/cache/eval_results/{bench_name}_{model_name}_*/*.json",
-        # 备用路径
-        f"{REPO_ROOT}/results/{thread_id}/{bench_name}/{model_name}/*.json",
-        f"{REPO_ROOT}/results/{thread_id}/{bench_name}/{model_name}/*.jsonl",
-    ]
-
-    for pattern in search_patterns:
-        files = glob.glob(pattern)
-        if files:
-            result_file = files[0]
-            # 生成友好的文件名
-            filename = f"{bench_name}_{model_name}_results.json"
-            if result_file.endswith('.jsonl'):
-                filename = filename.replace('.json', '.jsonl')
-
-            return FileResponse(
-                path=result_file,
-                filename=filename,
-                media_type="application/json",
-            )
-
-    # 如果没找到，返回简单错误
-    raise HTTPException(
-        status_code=404,
-        detail=f"Result file not found for {bench_name}/{model_name}. Check cache/eval_results/ directory."
+    filename = f"{bench_name}_{model_name}_results.json"
+    if result_file.endswith('.jsonl'):
+        filename = filename.replace('.json', '.jsonl')
+    return FileResponse(
+        path=result_file,
+        filename=filename,
+        media_type="application/json",
     )
 
 
 @app.get("/api/eval/preview/{thread_id}/{bench_name}/{model_name}")
 async def preview_eval_result(thread_id: str, bench_name: str, model_name: str, limit: int = 20):
-    """预览评测结果（返回前 N 条记录） - 简化版本"""
-    import glob
+    """预览评测结果（返回前 N 条记录） - 简化版本。
+    走 _find_result_file 统一逻辑（safe escaping、不再宽松 fallback）。"""
     import pandas as pd
 
-    # 使用与下载API相同的路径查找逻辑
-    search_patterns = [
-        f"{REPO_ROOT}/cache/eval_results/{bench_name}_{model_name}_*/step_step1.jsonl",
-        f"{REPO_ROOT}/cache/eval_results/{bench_name}_{model_name}_*/*.jsonl",
-        f"{REPO_ROOT}/cache/eval_results/{bench_name}_{model_name}_*/*.json",
-        f"{REPO_ROOT}/results/{thread_id}/{bench_name}/{model_name}/*.json",
-        f"{REPO_ROOT}/results/{thread_id}/{bench_name}/{model_name}/*.jsonl",
-    ]
-
-    detail_path = None
-    for pattern in search_patterns:
-        files = glob.glob(pattern)
-        if files:
-            detail_path = files[0]
-            break
-
+    detail_path = _find_result_file(bench_name, model_name, thread_id)
     if not detail_path or not os.path.exists(detail_path):
         raise HTTPException(
             status_code=404,
-            detail=f"Result file not found for {bench_name}/{model_name}. Check cache/eval_results/ directory."
+            detail=f"Result file not found for {bench_name}/{model_name}. Check cache/eval_results/ directory.",
         )
 
     # 读取文件
